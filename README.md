@@ -20,9 +20,9 @@ SM4-encrypted after an SM2 key exchange.
 | Foreign/stale templates can't authenticate (template id + tag check) | ✅ verified |
 | Delete a print from the module (per-print identity) | ✅ verified |
 | Wipe all templates | ❌ deliberately not implemented (see Safety) |
-| Cancel (module-side cancel command) | implemented, not yet tested |
+| Cancel (module-side cancel command) | ✅ verified (identify and enroll) |
 | fprintd enroll / verify / delete | ✅ (`libfprint-btl-syno` pkgrel 3; verify 3/3) |
-| PAM (sudo, lock screen) | ⏳ not configured yet |
+| PAM: KDE lock screen, sudo | ✅ (`scripts/pam-enable.sh`, also polkit + LightDM; undo: `pam-revert.sh`) |
 
 ## Safety
 
@@ -44,6 +44,7 @@ lost a reader to an unvetted "clear" command.
 | `experiments/` | interactive hardware tests |
 | `docs/PROTOCOL.md` | the protocol |
 | `docs/RE-NOTES.md` | how it was found, function map, module state |
+| `scripts/pam-enable.sh`, `pam-revert.sh` | add/remove `pam_fprintd` for sudo, polkit, LightDM (backups in /root) |
 | `70-libfprint-betterlife.rules` | udev rule for the Python tools |
 
 ## Quick start (Python tool)

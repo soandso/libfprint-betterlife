@@ -98,6 +98,12 @@ sends `IOCTL_CUSTOM_END_ENROLL` (0x440410) with the 32-byte account SID.
     (0 before, 0 after), fprintd removed the host print. `fprintd-enroll` right index 7/7,
     `fprintd-verify` **3/3 match**.
 
+24. Cancel (`experiments/lf_cancel.py`): identify and enroll cancelled after 3 s send `B1/1` / `B0/3`,
+    get an immediate reply, return G_IO_ERROR_CANCELLED; next operation fine; count unchanged.
+25. PAM: `scripts/pam-enable.sh` adds `auth sufficient pam_fprintd.so max-tries=3 timeout=10` to
+    sudo, polkit-1 (new /etc copy) and lightdm. sudo: fingerprint accepted; timeout falls back to the
+    password. KDE lock screen (kde-fingerprint): works. LightDM/polkit not separately tested.
+
 ## Module state after this session
 
 1 of 10: the user's fprintd right-index enrollment (template 0).
