@@ -1,0 +1,34 @@
+pkgbase = libfprint-betterlife
+	pkgdesc = Library for fingerprint readers, with a driver for the Betterlife 347d:0302 reader
+	pkgver = 1.94.100
+	pkgrel = 1
+	url = https://github.com/soandso/libfprint-betterlife
+	arch = x86_64
+	groups = fprint
+	license = LGPL-2.1-or-later
+	checkdepends = cairo
+	checkdepends = umockdev
+	makedepends = git
+	makedepends = glib2-devel
+	makedepends = gobject-introspection
+	makedepends = gtk-doc
+	makedepends = meson
+	makedepends = python-cairo
+	makedepends = python-gobject
+	makedepends = systemd
+	depends = libgcc
+	depends = glib2
+	depends = glibc
+	depends = libgudev
+	depends = libgusb
+	depends = openssl
+	depends = pixman
+	provides = libfprint=1.94.100
+	provides = libfprint-2.so
+	conflicts = libfprint
+	source = git+https://gitlab.freedesktop.org/libfprint/libfprint.git#tag=v1.94.100
+	source = 0001-add-betterlife-driver-0.1.0.patch::https://github.com/soandso/libfprint-betterlife/releases/download/v0.1.0/0001-add-betterlife-driver.patch
+	b2sums = SKIP
+	b2sums = 6d1c3dafb2472820111774c1e5411f22a437405869dc51ac98475742bd20d72c349128337f80dc23e40275eecdf0c7d998ec652e2f8efb44d7c00b9153873701
+
+pkgname = libfprint-betterlife

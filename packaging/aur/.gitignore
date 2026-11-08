@@ -1,0 +1,6 @@
+src/
+pkg/
+libfprint/
+*.pkg.tar.zst
+*.patch
+build.log

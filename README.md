@@ -52,6 +52,9 @@ Evidence for each line: [`docs/VALIDATION.md`](docs/VALIDATION.md).
 
 ## Install
 
+Releases: <https://github.com/soandso/libfprint-betterlife/releases> (the patch is attached).
+An AUR-ready `PKGBUILD` that uses the release is in [`packaging/aur/`](packaging/aur/).
+
 The patch applies to libfprint v1.94.100. On Arch, the combined package with this driver and the
 Synochip one is built from the sibling repo `../libfprint-btl-syno` (it fetches
 `packaging/0001-add-betterlife-driver.patch` from here; run its `./update.sh` after changing the driver).
