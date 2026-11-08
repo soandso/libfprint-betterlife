@@ -28,8 +28,10 @@
 
 #include <string.h>
 
+#include <openssl/bn.h>
 #include <openssl/core_names.h>
 #include <openssl/evp.h>
+#include <openssl/param_build.h>
 #include <openssl/rand.h>
 
 #include "drivers_api.h"
@@ -63,6 +65,7 @@ struct _FpiDeviceBetterlife
   guint       enroll_done;
   GError     *pending_error;        /* reported after a module-side cancel */
   gint        count_before;         /* template count before a removal */
+  guint32     emu_counter;          /* emulation (umockdev tests): deterministic "randomness" */
   guint8      identity[BTL_IDENTITY_LEN];
 };
 
@@ -266,6 +269,71 @@ btl_sm2_decrypt_session_key (FpiDeviceBetterlife *self, const guint8 *ct,
   OPENSSL_cleanse (out, sizeof out);
   EVP_PKEY_CTX_free (ctx);
   return ok;
+}
+
+/* -------------------------------------------- randomness / emulation mode */
+
+/* umockdev tests replay a recorded session, so in emulation mode (test helper
+ * library loaded + FP_DEVICE_EMULATION=1, never in a normal install) the host
+ * side must be deterministic: a fixed SM2 key pair (test-only, generated for
+ * this purpose) and counter-based IVs/identities. */
+static const guint8 btl_emu_sm2_priv[32] = {
+  0x36, 0x9b, 0x04, 0xba, 0x3e, 0x8c, 0xbc, 0x30, 0x25, 0xc5, 0x51, 0x3b,
+  0x19, 0xcb, 0x28, 0xc1, 0xb7, 0xcf, 0xfa, 0x30, 0xdc, 0x3f, 0x2c, 0x5f,
+  0x4f, 0x81, 0xa4, 0x4d, 0xde, 0x19, 0x5f, 0xaa
+};
+static const guint8 btl_emu_sm2_pub[65] = {
+  0x04, 0xa2, 0xdd, 0xb0, 0xb0, 0xbd, 0x82, 0x74, 0x46, 0x1d, 0x02, 0x1f,
+  0x45, 0x56, 0x35, 0x8f, 0x0a, 0x9b, 0x40, 0xe3, 0x9d, 0x18, 0xda, 0x0b,
+  0x19, 0x92, 0x60, 0xa6, 0x38, 0x82, 0xa8, 0x19, 0x92, 0x74, 0x06, 0xb6,
+  0xb1, 0x7d, 0xfb, 0x49, 0x50, 0x0b, 0x5d, 0x91, 0xa6, 0xc7, 0x7e, 0x72,
+  0x3b, 0x37, 0xe3, 0x6d, 0xa6, 0x45, 0x59, 0xf6, 0xf5, 0xb1, 0x4c, 0x97,
+  0xe3, 0x3f, 0xe1, 0x1c, 0xe4
+};
+
+static gboolean
+btl_random (FpiDeviceBetterlife *self, guint8 *buf, gsize len)
+{
+  if (fpi_device_emulation_mode_enabled (FP_DEVICE (self)))
+    {
+      memset (buf, 0xA5, len);       /* never all-zero: that would mean plaintext */
+      self->emu_counter++;
+      for (gsize i = 0; i < MIN (len, 4); i++)
+        buf[len - 1 - i] = (self->emu_counter >> (8 * i)) & 0xFF;
+      return TRUE;
+    }
+  return RAND_bytes (buf, len) == 1;
+}
+
+static EVP_PKEY *
+btl_sm2_keygen (FpiDeviceBetterlife *self)
+{
+  OSSL_PARAM_BLD *bld = NULL;
+  OSSL_PARAM *params = NULL;
+  EVP_PKEY_CTX *ctx = NULL;
+  EVP_PKEY *pkey = NULL;
+  BIGNUM *priv = NULL;
+
+  if (!fpi_device_emulation_mode_enabled (FP_DEVICE (self)))
+    return EVP_PKEY_Q_keygen (NULL, NULL, "SM2");
+
+  fp_dbg ("Emulation mode: using the fixed test SM2 key and counter IVs");
+  if ((bld = OSSL_PARAM_BLD_new ()) &&
+      (priv = BN_bin2bn (btl_emu_sm2_priv, sizeof btl_emu_sm2_priv, NULL)) &&
+      OSSL_PARAM_BLD_push_utf8_string (bld, OSSL_PKEY_PARAM_GROUP_NAME, "SM2", 0) &&
+      OSSL_PARAM_BLD_push_BN (bld, OSSL_PKEY_PARAM_PRIV_KEY, priv) &&
+      OSSL_PARAM_BLD_push_octet_string (bld, OSSL_PKEY_PARAM_PUB_KEY,
+                                        btl_emu_sm2_pub, sizeof btl_emu_sm2_pub) &&
+      (params = OSSL_PARAM_BLD_to_param (bld)) &&
+      (ctx = EVP_PKEY_CTX_new_from_name (NULL, "SM2", NULL)) &&
+      EVP_PKEY_fromdata_init (ctx) == 1)
+    EVP_PKEY_fromdata (ctx, &pkey, EVP_PKEY_KEYPAIR, params);
+
+  EVP_PKEY_CTX_free (ctx);
+  OSSL_PARAM_free (params);
+  BN_clear_free (priv);
+  OSSL_PARAM_BLD_free (bld);
+  return pkey;
 }
 
 /* -------------------------------------------------------------- transport */
@@ -492,7 +560,7 @@ btl_cmd (FpiDeviceBetterlife *self, guint8 cmd, guint8 p1,
   FP_WRITE_UINT32_LE (f + 1, 20 + blen);
   if (encrypt)
     {
-      if (RAND_bytes (f + 5, BTL_IV_LEN) != 1 ||
+      if (!btl_random (self, f + 5, BTL_IV_LEN) ||
           !btl_crypt_body (self, f + 5, TRUE, body, f + BTL_HDR_LEN, blen))
         {
           fpi_usb_transfer_unref (transfer);
@@ -702,7 +770,7 @@ open_run_state (FpiSsm *ssm, FpDevice *dev)
         size_t publen = 0;
 
         EVP_PKEY_free (self->sm2_key);
-        self->sm2_key = EVP_PKEY_Q_keygen (NULL, NULL, "SM2");
+        self->sm2_key = btl_sm2_keygen (self);
         if (!self->sm2_key ||
             EVP_PKEY_get_octet_string_param (self->sm2_key,
                                              OSSL_PKEY_PARAM_ENCODED_PUBLIC_KEY,
@@ -748,6 +816,7 @@ betterlife_open (FpDevice *dev)
   g_byte_array_set_size (self->rx, 0);
   self->have_session = FALSE;
   self->resync_tries = 0;
+  self->emu_counter = 0;
   self->task_ssm = fpi_ssm_new (dev, open_run_state, OPEN_STATES);
   fpi_ssm_start (self->task_ssm, open_ssm_done);
 }
@@ -961,7 +1030,7 @@ enroll_run_state (FpiSsm *ssm, FpDevice *dev)
         guint8 rnd[13];
 
         /* "LFP-" + 26 hex digits, NUL padded: see btl_identity_valid() */
-        if (RAND_bytes (rnd, sizeof rnd) != 1)
+        if (!btl_random (self, rnd, sizeof rnd))
           {
             fpi_ssm_mark_failed (ssm, fpi_device_error_new (FP_DEVICE_ERROR_GENERAL));
             return;
@@ -1009,6 +1078,8 @@ betterlife_enroll (FpDevice *dev)
   fpi_ssm_start (self->task_ssm, enroll_ssm_done);
 }
 
+static gboolean btl_print_get_identity (FpPrint *print, guint8 *identity);
+
 /* ------------------------------------------------------- verify/identify */
 
 enum {
@@ -1017,6 +1088,22 @@ enum {
   MATCH_CANCEL,             /* only entered via jump_to_state */
   MATCH_STATES,
 };
+
+/* The print the module recognised: template id + tag from the identify reply,
+ * plus the identity of the matching print if we know it. A print equal to the
+ * matching gallery print, as libfprint expects for match-on-chip devices. */
+static FpPrint *
+btl_scanned_print (FpiDeviceBetterlife *self, guint16 tid, const guint8 *tag,
+                   FpPrint *known)
+{
+  FpPrint *print = fp_print_new (FP_DEVICE (self));
+  guint8 identity[BTL_IDENTITY_LEN] = { 0 };
+
+  if (known)
+    btl_print_get_identity (known, identity);
+  btl_print_set_data (print, tid, tag, identity);
+  return print;
+}
 
 static void
 match_report (FpiDeviceBetterlife *self, gboolean have_match, guint16 tid,
@@ -1027,19 +1114,28 @@ match_report (FpiDeviceBetterlife *self, gboolean have_match, guint16 tid,
   if (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_VERIFY)
     {
       FpPrint *print = NULL;
+      FpPrint *scanned = NULL;
       FpiMatchResult result = FPI_MATCH_FAIL;
 
       fpi_device_get_verify_data (dev, &print);
       if (retry)
-        result = FPI_MATCH_ERROR;
-      else if (have_match && btl_print_matches (print, tid, tag))
-        result = FPI_MATCH_SUCCESS;
-      fpi_device_verify_report (dev, result, NULL, retry);
+        {
+          result = FPI_MATCH_ERROR;
+        }
+      else if (have_match)
+        {
+          gboolean ok = btl_print_matches (print, tid, tag);
+
+          result = ok ? FPI_MATCH_SUCCESS : FPI_MATCH_FAIL;
+          scanned = btl_scanned_print (self, tid, tag, ok ? print : NULL);
+        }
+      fpi_device_verify_report (dev, result, scanned, retry);
     }
   else
     {
       GPtrArray *prints = NULL;
       FpPrint *match = NULL;
+      FpPrint *scanned = NULL;
 
       fpi_device_get_identify_data (dev, &prints);
       for (guint i = 0; have_match && !retry && i < prints->len; i++)
@@ -1050,7 +1146,9 @@ match_report (FpiDeviceBetterlife *self, gboolean have_match, guint16 tid,
           }
       if (have_match && !match && !retry)
         fp_info ("Module matched template %u, which belongs to no known print", tid);
-      fpi_device_identify_report (dev, match, NULL, retry);
+      if (have_match && !retry)
+        scanned = btl_scanned_print (self, tid, tag, match);
+      fpi_device_identify_report (dev, match, scanned, retry);
     }
 }
 

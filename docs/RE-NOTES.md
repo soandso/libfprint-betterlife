@@ -104,6 +104,17 @@ sends `IOCTL_CUSTOM_END_ENROLL` (0x440410) with the 32-byte account SID.
     sudo, polkit-1 (new /etc copy) and lightdm. sudo: fingerprint accepted; timeout falls back to the
     password. KDE lock screen (kde-fingerprint): works. LightDM/polkit not separately tested.
 
+26. umockdev test. The host side is randomised (SM2 key, IVs, identities), so in libfprint emulation
+    mode (`fpi_device_emulation_mode_enabled()`: FP_DEVICE_EMULATION=1 *and* the test helper library
+    present, i.e. never in an installed package built with installed-tests=false) the driver uses a
+    fixed test-only SM2 key pair and counter-based IVs/identities. First recording failed twice over:
+    `usbmon` module not loaded (tshark "Permission denied"), and identify reported no scanned print
+    (libfprint expects one equal to the match) — fixed (`btl_scanned_print`). The crashed run left
+    its left-index template on the module; removed by its deterministic identity
+    `LFP-a5a5a5a5a5a5a5a5a50000000a` (count 2→1). Second recording OK (enroll 7/7, verify, identify,
+    delete). Replay: `meson test betterlife` OK, valgrind 0 leaks / 0 errors, all-drivers suite and
+    the package check() 131/131.
+
 ## Module state after this session
 
 1 of 10: the user's fprintd right-index enrollment (template 0).

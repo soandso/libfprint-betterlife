@@ -30,7 +30,12 @@ assumed "clear all" opcode; that is why this project is allowlist-only).
 - After editing the driver: copy to `driver/`, re-export
   `git -C libfprint diff HEAD -- meson.build libfprint/meson.build data/autosuspend.hwdb libfprint/drivers/betterlife > packaging/0001-add-betterlife-driver.patch`,
   run `.venv/bin/python -m unittest discover -s tests`.
-- umockdev is not installed, so libfprint driver tests skip.
+- umockdev test: `libfprint/tests/betterlife/` (copy in `tests/umockdev/`). Re-record (root, 9 touches with a
+  finger NOT enrolled): `sudo modprobe usbmon && sudo libfprint/build/tests/create-driver-test.py --test custom betterlife`,
+  then take ownership of the root-owned files. Replay: `meson test -C libfprint/build betterlife`
+  (`--setup=valgrind` too). Any change to the command sequence needs a new recording; emulation
+  mode makes the host side deterministic (fixed test SM2 key, counter IVs/identities).
+- Export the patch with `--binary` and include `tests/meson.build tests/betterlife` (git add -N first).
 - `examples/verify` fails with "Device has no storage" (no `list`); use
   `experiments/lf_verify_delete.py` (GI against libfprint/build, needs GI_TYPELIB_PATH/LD_LIBRARY_PATH).
 - Package: `packaging/arch` (`libfprint-btl-syno`, replaces libfprint-synochip). After changing the

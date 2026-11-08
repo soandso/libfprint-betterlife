@@ -22,6 +22,7 @@ SM4-encrypted after an SM2 key exchange.
 | Wipe all templates | ❌ deliberately not implemented (see Safety) |
 | Cancel (module-side cancel command) | ✅ verified (identify and enroll) |
 | fprintd enroll / verify / delete | ✅ (`libfprint-btl-syno` pkgrel 3; verify 3/3) |
+| libfprint umockdev test (recorded on hardware, replays in CI) | ✅ `tests/umockdev/`, valgrind clean |
 | PAM: KDE lock screen, sudo | ✅ (`scripts/pam-enable.sh`, also polkit + LightDM; undo: `pam-revert.sh`) |
 
 ## Safety

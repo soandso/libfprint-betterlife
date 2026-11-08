@@ -16,10 +16,10 @@ index dcf2d11..341a4c9 100644
  usb:v1C7Ap0571*
 diff --git a/libfprint/drivers/betterlife/betterlife.c b/libfprint/drivers/betterlife/betterlife.c
 new file mode 100644
-index 0000000..aab61c8
+index 0000000..2ac742e
 --- /dev/null
 +++ b/libfprint/drivers/betterlife/betterlife.c
-@@ -0,0 +1,1358 @@
+@@ -0,0 +1,1456 @@
 +/*
 + * Betterlife (BLESTECH) match-on-chip USB fingerprint module, 347d:0302
 + *
@@ -50,8 +50,10 @@ index 0000000..aab61c8
 +
 +#include <string.h>
 +
++#include <openssl/bn.h>
 +#include <openssl/core_names.h>
 +#include <openssl/evp.h>
++#include <openssl/param_build.h>
 +#include <openssl/rand.h>
 +
 +#include "drivers_api.h"
@@ -85,6 +87,7 @@ index 0000000..aab61c8
 +  guint       enroll_done;
 +  GError     *pending_error;        /* reported after a module-side cancel */
 +  gint        count_before;         /* template count before a removal */
++  guint32     emu_counter;          /* emulation (umockdev tests): deterministic "randomness" */
 +  guint8      identity[BTL_IDENTITY_LEN];
 +};
 +
@@ -288,6 +291,71 @@ index 0000000..aab61c8
 +  OPENSSL_cleanse (out, sizeof out);
 +  EVP_PKEY_CTX_free (ctx);
 +  return ok;
++}
++
++/* -------------------------------------------- randomness / emulation mode */
++
++/* umockdev tests replay a recorded session, so in emulation mode (test helper
++ * library loaded + FP_DEVICE_EMULATION=1, never in a normal install) the host
++ * side must be deterministic: a fixed SM2 key pair (test-only, generated for
++ * this purpose) and counter-based IVs/identities. */
++static const guint8 btl_emu_sm2_priv[32] = {
++  0x36, 0x9b, 0x04, 0xba, 0x3e, 0x8c, 0xbc, 0x30, 0x25, 0xc5, 0x51, 0x3b,
++  0x19, 0xcb, 0x28, 0xc1, 0xb7, 0xcf, 0xfa, 0x30, 0xdc, 0x3f, 0x2c, 0x5f,
++  0x4f, 0x81, 0xa4, 0x4d, 0xde, 0x19, 0x5f, 0xaa
++};
++static const guint8 btl_emu_sm2_pub[65] = {
++  0x04, 0xa2, 0xdd, 0xb0, 0xb0, 0xbd, 0x82, 0x74, 0x46, 0x1d, 0x02, 0x1f,
++  0x45, 0x56, 0x35, 0x8f, 0x0a, 0x9b, 0x40, 0xe3, 0x9d, 0x18, 0xda, 0x0b,
++  0x19, 0x92, 0x60, 0xa6, 0x38, 0x82, 0xa8, 0x19, 0x92, 0x74, 0x06, 0xb6,
++  0xb1, 0x7d, 0xfb, 0x49, 0x50, 0x0b, 0x5d, 0x91, 0xa6, 0xc7, 0x7e, 0x72,
++  0x3b, 0x37, 0xe3, 0x6d, 0xa6, 0x45, 0x59, 0xf6, 0xf5, 0xb1, 0x4c, 0x97,
++  0xe3, 0x3f, 0xe1, 0x1c, 0xe4
++};
++
++static gboolean
++btl_random (FpiDeviceBetterlife *self, guint8 *buf, gsize len)
++{
++  if (fpi_device_emulation_mode_enabled (FP_DEVICE (self)))
++    {
++      memset (buf, 0xA5, len);       /* never all-zero: that would mean plaintext */
++      self->emu_counter++;
++      for (gsize i = 0; i < MIN (len, 4); i++)
++        buf[len - 1 - i] = (self->emu_counter >> (8 * i)) & 0xFF;
++      return TRUE;
++    }
++  return RAND_bytes (buf, len) == 1;
++}
++
++static EVP_PKEY *
++btl_sm2_keygen (FpiDeviceBetterlife *self)
++{
++  OSSL_PARAM_BLD *bld = NULL;
++  OSSL_PARAM *params = NULL;
++  EVP_PKEY_CTX *ctx = NULL;
++  EVP_PKEY *pkey = NULL;
++  BIGNUM *priv = NULL;
++
++  if (!fpi_device_emulation_mode_enabled (FP_DEVICE (self)))
++    return EVP_PKEY_Q_keygen (NULL, NULL, "SM2");
++
++  fp_dbg ("Emulation mode: using the fixed test SM2 key and counter IVs");
++  if ((bld = OSSL_PARAM_BLD_new ()) &&
++      (priv = BN_bin2bn (btl_emu_sm2_priv, sizeof btl_emu_sm2_priv, NULL)) &&
++      OSSL_PARAM_BLD_push_utf8_string (bld, OSSL_PKEY_PARAM_GROUP_NAME, "SM2", 0) &&
++      OSSL_PARAM_BLD_push_BN (bld, OSSL_PKEY_PARAM_PRIV_KEY, priv) &&
++      OSSL_PARAM_BLD_push_octet_string (bld, OSSL_PKEY_PARAM_PUB_KEY,
++                                        btl_emu_sm2_pub, sizeof btl_emu_sm2_pub) &&
++      (params = OSSL_PARAM_BLD_to_param (bld)) &&
++      (ctx = EVP_PKEY_CTX_new_from_name (NULL, "SM2", NULL)) &&
++      EVP_PKEY_fromdata_init (ctx) == 1)
++    EVP_PKEY_fromdata (ctx, &pkey, EVP_PKEY_KEYPAIR, params);
++
++  EVP_PKEY_CTX_free (ctx);
++  OSSL_PARAM_free (params);
++  BN_clear_free (priv);
++  OSSL_PARAM_BLD_free (bld);
++  return pkey;
 +}
 +
 +/* -------------------------------------------------------------- transport */
@@ -514,7 +582,7 @@ index 0000000..aab61c8
 +  FP_WRITE_UINT32_LE (f + 1, 20 + blen);
 +  if (encrypt)
 +    {
-+      if (RAND_bytes (f + 5, BTL_IV_LEN) != 1 ||
++      if (!btl_random (self, f + 5, BTL_IV_LEN) ||
 +          !btl_crypt_body (self, f + 5, TRUE, body, f + BTL_HDR_LEN, blen))
 +        {
 +          fpi_usb_transfer_unref (transfer);
@@ -724,7 +792,7 @@ index 0000000..aab61c8
 +        size_t publen = 0;
 +
 +        EVP_PKEY_free (self->sm2_key);
-+        self->sm2_key = EVP_PKEY_Q_keygen (NULL, NULL, "SM2");
++        self->sm2_key = btl_sm2_keygen (self);
 +        if (!self->sm2_key ||
 +            EVP_PKEY_get_octet_string_param (self->sm2_key,
 +                                             OSSL_PKEY_PARAM_ENCODED_PUBLIC_KEY,
@@ -770,6 +838,7 @@ index 0000000..aab61c8
 +  g_byte_array_set_size (self->rx, 0);
 +  self->have_session = FALSE;
 +  self->resync_tries = 0;
++  self->emu_counter = 0;
 +  self->task_ssm = fpi_ssm_new (dev, open_run_state, OPEN_STATES);
 +  fpi_ssm_start (self->task_ssm, open_ssm_done);
 +}
@@ -983,7 +1052,7 @@ index 0000000..aab61c8
 +        guint8 rnd[13];
 +
 +        /* "LFP-" + 26 hex digits, NUL padded: see btl_identity_valid() */
-+        if (RAND_bytes (rnd, sizeof rnd) != 1)
++        if (!btl_random (self, rnd, sizeof rnd))
 +          {
 +            fpi_ssm_mark_failed (ssm, fpi_device_error_new (FP_DEVICE_ERROR_GENERAL));
 +            return;
@@ -1031,6 +1100,8 @@ index 0000000..aab61c8
 +  fpi_ssm_start (self->task_ssm, enroll_ssm_done);
 +}
 +
++static gboolean btl_print_get_identity (FpPrint *print, guint8 *identity);
++
 +/* ------------------------------------------------------- verify/identify */
 +
 +enum {
@@ -1039,6 +1110,22 @@ index 0000000..aab61c8
 +  MATCH_CANCEL,             /* only entered via jump_to_state */
 +  MATCH_STATES,
 +};
++
++/* The print the module recognised: template id + tag from the identify reply,
++ * plus the identity of the matching print if we know it. A print equal to the
++ * matching gallery print, as libfprint expects for match-on-chip devices. */
++static FpPrint *
++btl_scanned_print (FpiDeviceBetterlife *self, guint16 tid, const guint8 *tag,
++                   FpPrint *known)
++{
++  FpPrint *print = fp_print_new (FP_DEVICE (self));
++  guint8 identity[BTL_IDENTITY_LEN] = { 0 };
++
++  if (known)
++    btl_print_get_identity (known, identity);
++  btl_print_set_data (print, tid, tag, identity);
++  return print;
++}
 +
 +static void
 +match_report (FpiDeviceBetterlife *self, gboolean have_match, guint16 tid,
@@ -1049,19 +1136,28 @@ index 0000000..aab61c8
 +  if (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_VERIFY)
 +    {
 +      FpPrint *print = NULL;
++      FpPrint *scanned = NULL;
 +      FpiMatchResult result = FPI_MATCH_FAIL;
 +
 +      fpi_device_get_verify_data (dev, &print);
 +      if (retry)
-+        result = FPI_MATCH_ERROR;
-+      else if (have_match && btl_print_matches (print, tid, tag))
-+        result = FPI_MATCH_SUCCESS;
-+      fpi_device_verify_report (dev, result, NULL, retry);
++        {
++          result = FPI_MATCH_ERROR;
++        }
++      else if (have_match)
++        {
++          gboolean ok = btl_print_matches (print, tid, tag);
++
++          result = ok ? FPI_MATCH_SUCCESS : FPI_MATCH_FAIL;
++          scanned = btl_scanned_print (self, tid, tag, ok ? print : NULL);
++        }
++      fpi_device_verify_report (dev, result, scanned, retry);
 +    }
 +  else
 +    {
 +      GPtrArray *prints = NULL;
 +      FpPrint *match = NULL;
++      FpPrint *scanned = NULL;
 +
 +      fpi_device_get_identify_data (dev, &prints);
 +      for (guint i = 0; have_match && !retry && i < prints->len; i++)
@@ -1072,7 +1168,9 @@ index 0000000..aab61c8
 +          }
 +      if (have_match && !match && !retry)
 +        fp_info ("Module matched template %u, which belongs to no known print", tid);
-+      fpi_device_identify_report (dev, match, NULL, retry);
++      if (have_match && !retry)
++        scanned = btl_scanned_print (self, tid, tag, match);
++      fpi_device_identify_report (dev, match, scanned, retry);
 +    }
 +}
 +
@@ -1476,3 +1574,733 @@ index ab09dc1..e06f42d 100644
      'upektc': {},
      'upeksonly': {},
      'upekts': {},
+diff --git a/tests/betterlife/custom.pcapng b/tests/betterlife/custom.pcapng
+new file mode 100644
+index 0000000000000000000000000000000000000000..4428e706c75ab9e5f7e7eb1480a84f94ac72ea3c
+GIT binary patch
+literal 11788
+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
+Mf8+h2eiJA@0U$$|(f|Me
+
+literal 0
+HcmV?d00001
+
+diff --git a/tests/betterlife/custom.py b/tests/betterlife/custom.py
+new file mode 100755
+index 0000000..d68ed6b
+--- /dev/null
++++ b/tests/betterlife/custom.py
+@@ -0,0 +1,81 @@
++#!/usr/bin/env python3
++
++import traceback
++import sys
++import gi
++
++gi.require_version('FPrint', '2.0')
++from gi.repository import FPrint, GLib
++
++# Exit with error on any exception, included those happening in async callbacks
++sys.excepthook = lambda *args: (traceback.print_exception(*args), sys.exit(1))
++
++ctx = GLib.main_context_default()
++
++c = FPrint.Context()
++c.enumerate()
++devices = c.get_devices()
++
++d = devices[0]
++del devices
++
++assert d.get_driver() == "betterlife"
++assert not d.has_feature(FPrint.DeviceFeature.CAPTURE)
++assert d.has_feature(FPrint.DeviceFeature.IDENTIFY)
++assert d.has_feature(FPrint.DeviceFeature.VERIFY)
++assert not d.has_feature(FPrint.DeviceFeature.DUPLICATES_CHECK)
++assert d.has_feature(FPrint.DeviceFeature.STORAGE)
++assert not d.has_feature(FPrint.DeviceFeature.STORAGE_LIST)
++assert d.has_feature(FPrint.DeviceFeature.STORAGE_DELETE)
++assert d.has_feature(FPrint.DeviceFeature.STORAGE_CLEAR)
++
++d.open_sync()
++
++# Wiping the module is deliberately not supported (and sends nothing)
++try:
++    d.clear_storage_sync()
++    assert False, "clear_storage unexpectedly succeeded"
++except GLib.Error as e:
++    assert e.matches(FPrint.DeviceError.quark(), FPrint.DeviceError.NOT_SUPPORTED)
++
++template = FPrint.Print.new(d)
++
++def enroll_progress(*args):
++    print('enroll progress: ' + str(args))
++
++def identify_done(dev, res):
++    global identified
++    identified = True
++    identify_match, identify_print = dev.identify_finish(res)
++    print('identification done: ', identify_match, identify_print)
++    assert identify_match.equal(identify_print)
++
++print("enrolling")
++assert d.get_finger_status() == FPrint.FingerStatusFlags.NONE
++p = d.enroll_sync(template, None, enroll_progress, None)
++assert d.get_finger_status() == FPrint.FingerStatusFlags.NONE
++print("enroll done")
++
++print("verifying")
++verify_res, verify_print = d.verify_sync(p)
++assert d.get_finger_status() == FPrint.FingerStatusFlags.NONE
++print("verify done")
++assert verify_res == True
++
++identified = False
++deserialized = FPrint.Print.deserialize(p.serialize())
++assert deserialized.equal(p)
++
++print('async identifying')
++d.identify([deserialized], callback=identify_done)
++while not identified:
++    ctx.iteration(True)
++
++print("deleting")
++d.delete_print_sync(p)
++print("delete done")
++
++d.close_sync()
++
++del d
++del c
+diff --git a/tests/betterlife/device b/tests/betterlife/device
+new file mode 100644
+index 0000000..74af105
+--- /dev/null
++++ b/tests/betterlife/device
+@@ -0,0 +1,538 @@
++P: /devices/pci0000:00/0000:00:08.1/0000:0f:00.3/usb7/7-3/7-3.4/7-3.4.1
++N: bus/usb/007/020=12011001000000407D34020300010102030109022000010100E0F00904000002FF0000000705810240000007050202400000
++E: BUSNUM=007
++E: CURRENT_TAGS=:uaccess:seat:
++E: DEVNAME=/dev/bus/usb/007/020
++E: DEVNUM=020
++E: DEVTYPE=usb_device
++E: DRIVER=usb
++E: ID_AUTOSUSPEND=1
++E: ID_BUS=usb
++E: ID_FOR_SEAT=usb-pci-0000_0f_00_3-usb-0_3_4_1
++E: ID_INTEGRATION=external
++E: ID_MODEL=Betterlife_Fingerprint
++E: ID_MODEL_ENC=Betterlife\x20Fingerprint
++E: ID_MODEL_ID=0302
++E: ID_PATH=pci-0000:0f:00.3-usb-0:3.4.1
++E: ID_PATH_TAG=pci-0000_0f_00_3-usb-0_3_4_1
++E: ID_PATH_WITH_USB_REVISION=pci-0000:0f:00.3-usbv2-0:3.4.1
++E: ID_PERSIST=0
++E: ID_REVISION=0100
++E: ID_SERIAL=btlfp_Betterlife_Fingerprint_Betterlife_V1.0.0.0-0f00
++E: ID_SERIAL_SHORT=Betterlife_V1.0.0.0-0f00
++E: ID_USB_INTERFACES=:ff0000:
++E: ID_USB_MODEL=Betterlife_Fingerprint
++E: ID_USB_MODEL_ENC=Betterlife\x20Fingerprint
++E: ID_USB_MODEL_ID=0302
++E: ID_USB_REVISION=0100
++E: ID_USB_SERIAL=btlfp_Betterlife_Fingerprint_Betterlife_V1.0.0.0-0f00
++E: ID_USB_SERIAL_SHORT=Betterlife_V1.0.0.0-0f00
++E: ID_USB_VENDOR=btlfp
++E: ID_USB_VENDOR_ENC=btlfp
++E: ID_USB_VENDOR_ID=347d
++E: ID_VENDOR=btlfp
++E: ID_VENDOR_ENC=btlfp
++E: ID_VENDOR_ID=347d
++E: MAJOR=189
++E: MINOR=787
++E: PRODUCT=347d/302/100
++E: SUBSYSTEM=usb
++E: TAGS=:uaccess:seat:
++E: TYPE=0/0/0
++A: authorized=1\n
++A: avoid_reset_quirk=0\n
++A: bConfigurationValue=1\n
++A: bDeviceClass=00\n
++A: bDeviceProtocol=00\n
++A: bDeviceSubClass=00\n
++A: bMaxPacketSize0=64\n
++A: bMaxPower=480mA\n
++A: bNumConfigurations=1\n
++A: bNumInterfaces= 1\n
++A: bcdDevice=0100\n
++A: bmAttributes=e0\n
++A: busnum=7\n
++A: configuration=
++H: descriptors=12011001000000407D34020300010102030109022000010100E0F00904000002FF0000000705810240000007050202400000
++A: dev=189:787\n
++A: devnum=20\n
++A: devpath=3.4.1\n
++L: driver=../../../../../../../../bus/usb/drivers/usb
++A: idProduct=0302\n
++A: idVendor=347d\n
++A: ltm_capable=no\n
++A: manufacturer=btlfp\n
++A: maxchild=0\n
++L: port=../7-3.4:1.0/7-3.4-port1
++A: power/active_duration=404057\n
++A: power/autosuspend=2\n
++A: power/autosuspend_delay_ms=2000\n
++A: power/connected_duration=2397284\n
++A: power/control=auto\n
++A: power/level=auto\n
++A: power/persist=0\n
++A: power/runtime_active_time=405482\n
++A: power/runtime_status=active\n
++A: power/runtime_suspended_time=1991631\n
++A: power/wakeup=disabled\n
++A: power/wakeup_abort_count=\n
++A: power/wakeup_active=\n
++A: power/wakeup_active_count=\n
++A: power/wakeup_count=\n
++A: power/wakeup_expire_count=\n
++A: power/wakeup_last_time_ms=\n
++A: power/wakeup_max_time_ms=\n
++A: power/wakeup_total_time_ms=\n
++A: product=Betterlife Fingerprint\n
++A: quirks=0x0\n
++A: removable=unknown\n
++A: rx_lanes=1\n
++A: serial=Betterlife V1.0.0.0-0f00\n
++A: speed=12\n
++A: tx_lanes=1\n
++A: urbnum=603\n
++A: version= 1.10\n
++
++P: /devices/pci0000:00/0000:00:08.1/0000:0f:00.3/usb7/7-3/7-3.4
++N: bus/usb/007/007=1201100209000240DA0B115401000102000109022900010100E0000904000001090001000705810301000C0904000101090002000705810301000C
++E: BUSNUM=007
++E: CURRENT_TAGS=:seat:
++E: DEVNAME=/dev/bus/usb/007/007
++E: DEVNUM=007
++E: DEVTYPE=usb_device
++E: DRIVER=usb
++E: ID_BUS=usb
++E: ID_FOR_SEAT=usb-pci-0000_0f_00_3-usb-0_3_4
++E: ID_INTEGRATION=external
++E: ID_MODEL=USB2.1_Hub
++E: ID_MODEL_ENC=USB2.1\x20Hub
++E: ID_MODEL_FROM_DATABASE=RTS5411 Hub
++E: ID_MODEL_ID=5411
++E: ID_PATH=pci-0000:0f:00.3-usb-0:3.4
++E: ID_PATH_TAG=pci-0000_0f_00_3-usb-0_3_4
++E: ID_PATH_WITH_USB_REVISION=pci-0000:0f:00.3-usbv2-0:3.4
++E: ID_REVISION=0001
++E: ID_SERIAL=Generic_USB2.1_Hub
++E: ID_USB_INTERFACES=:090001:090002:
++E: ID_USB_MODEL=USB2.1_Hub
++E: ID_USB_MODEL_ENC=USB2.1\x20Hub
++E: ID_USB_MODEL_ID=5411
++E: ID_USB_REVISION=0001
++E: ID_USB_SERIAL=Generic_USB2.1_Hub
++E: ID_USB_VENDOR=Generic
++E: ID_USB_VENDOR_ENC=Generic
++E: ID_USB_VENDOR_ID=0bda
++E: ID_VENDOR=Generic
++E: ID_VENDOR_ENC=Generic
++E: ID_VENDOR_FROM_DATABASE=Realtek Semiconductor Corp.
++E: ID_VENDOR_ID=0bda
++E: MAJOR=189
++E: MINOR=774
++E: PRODUCT=bda/5411/1
++E: SUBSYSTEM=usb
++E: TAGS=:seat:
++E: TYPE=9/0/2
++A: authorized=1\n
++A: avoid_reset_quirk=0\n
++A: bConfigurationValue=1\n
++A: bDeviceClass=09\n
++A: bDeviceProtocol=02\n
++A: bDeviceSubClass=00\n
++A: bMaxPacketSize0=64\n
++A: bMaxPower=0mA\n
++A: bNumConfigurations=1\n
++A: bNumInterfaces= 1\n
++A: bcdDevice=0001\n
++A: bmAttributes=e0\n
++H: bos_descriptors=050F2A00030710021EF400000A1003000E00010AFF0314100400E5CDB920397011E0A9350002A5D5C51B
++A: busnum=7\n
++A: configuration=
++H: descriptors=1201100209000240DA0B115401000102000109022900010100E0000904000001090001000705810301000C0904000101090002000705810301000C
++A: dev=189:774\n
++A: devnum=7\n
++A: devpath=3.4\n
++L: driver=../../../../../../../bus/usb/drivers/usb
++A: idProduct=5411\n
++A: idVendor=0bda\n
++A: ltm_capable=no\n
++A: manufacturer=Generic\n
++A: maxchild=4\n
++L: port=../7-3:1.0/7-3-port4
++A: power/active_duration=5692640\n
++A: power/autosuspend=0\n
++A: power/autosuspend_delay_ms=0\n
++A: power/connected_duration=5692640\n
++A: power/control=auto\n
++A: power/level=auto\n
++A: power/runtime_active_time=5692465\n
++A: power/runtime_status=active\n
++A: power/runtime_suspended_time=0\n
++A: power/wakeup=disabled\n
++A: power/wakeup_abort_count=\n
++A: power/wakeup_active=\n
++A: power/wakeup_active_count=\n
++A: power/wakeup_count=\n
++A: power/wakeup_expire_count=\n
++A: power/wakeup_last_time_ms=\n
++A: power/wakeup_max_time_ms=\n
++A: power/wakeup_total_time_ms=\n
++A: product=USB2.1 Hub\n
++A: quirks=0x0\n
++A: removable=unknown\n
++A: rx_lanes=1\n
++A: speed=480\n
++A: tx_lanes=1\n
++A: urbnum=1780\n
++A: version= 2.10\n
++
++P: /devices/pci0000:00/0000:00:08.1/0000:0f:00.3/usb7/7-3
++N: bus/usb/007/003=1201100209000240DA0B115401000102000109022900010100E0000904000001090001000705810301000C0904000101090002000705810301000C
++E: BUSNUM=007
++E: CURRENT_TAGS=:seat:
++E: DEVNAME=/dev/bus/usb/007/003
++E: DEVNUM=003
++E: DEVTYPE=usb_device
++E: DRIVER=usb
++E: ID_BUS=usb
++E: ID_FOR_SEAT=usb-pci-0000_0f_00_3-usb-0_3
++E: ID_INTEGRATION=external
++E: ID_MODEL=USB2.1_Hub
++E: ID_MODEL_ENC=USB2.1\x20Hub
++E: ID_MODEL_FROM_DATABASE=RTS5411 Hub
++E: ID_MODEL_ID=5411
++E: ID_PATH=pci-0000:0f:00.3-usb-0:3
++E: ID_PATH_TAG=pci-0000_0f_00_3-usb-0_3
++E: ID_PATH_WITH_USB_REVISION=pci-0000:0f:00.3-usbv2-0:3
++E: ID_REVISION=0001
++E: ID_SERIAL=Generic_USB2.1_Hub
++E: ID_USB_INTERFACES=:090001:090002:
++E: ID_USB_MODEL=USB2.1_Hub
++E: ID_USB_MODEL_ENC=USB2.1\x20Hub
++E: ID_USB_MODEL_ID=5411
++E: ID_USB_REVISION=0001
++E: ID_USB_SERIAL=Generic_USB2.1_Hub
++E: ID_USB_VENDOR=Generic
++E: ID_USB_VENDOR_ENC=Generic
++E: ID_USB_VENDOR_ID=0bda
++E: ID_VENDOR=Generic
++E: ID_VENDOR_ENC=Generic
++E: ID_VENDOR_FROM_DATABASE=Realtek Semiconductor Corp.
++E: ID_VENDOR_ID=0bda
++E: MAJOR=189
++E: MINOR=770
++E: PRODUCT=bda/5411/1
++E: SUBSYSTEM=usb
++E: TAGS=:seat:
++E: TYPE=9/0/2
++A: authorized=1\n
++A: avoid_reset_quirk=0\n
++A: bConfigurationValue=1\n
++A: bDeviceClass=09\n
++A: bDeviceProtocol=02\n
++A: bDeviceSubClass=00\n
++A: bMaxPacketSize0=64\n
++A: bMaxPower=0mA\n
++A: bNumConfigurations=1\n
++A: bNumInterfaces= 1\n
++A: bcdDevice=0001\n
++A: bmAttributes=e0\n
++H: bos_descriptors=050F2A00030710021EF400000A1003000E00010AFF0314100400E5CDB920397011E0A9350002A5D5C51B
++A: busnum=7\n
++A: configuration=
++H: descriptors=1201100209000240DA0B115401000102000109022900010100E0000904000001090001000705810301000C0904000101090002000705810301000C
++A: dev=189:770\n
++A: devnum=3\n
++A: devpath=3\n
++L: driver=../../../../../../bus/usb/drivers/usb
++L: firmware_node=../../../../../LNXSYSTM:00/LNXSYBUS:00/PNP0A08:00/device:28/device:2a/device:2b/device:2e
++A: idProduct=5411\n
++A: idVendor=0bda\n
++A: ltm_capable=no\n
++A: manufacturer=Generic\n
++A: maxchild=4\n
++A: physical_location/dock=no\n
++A: physical_location/horizontal_position=left\n
++A: physical_location/lid=no\n
++A: physical_location/panel=back\n
++A: physical_location/vertical_position=center\n
++L: port=../7-0:1.0/usb7-port3
++A: power/active_duration=5694140\n
++A: power/autosuspend=0\n
++A: power/autosuspend_delay_ms=0\n
++A: power/connected_duration=5694140\n
++A: power/control=auto\n
++A: power/level=auto\n
++A: power/runtime_active_time=5693889\n
++A: power/runtime_status=active\n
++A: power/runtime_suspended_time=0\n
++A: power/wakeup=disabled\n
++A: power/wakeup_abort_count=\n
++A: power/wakeup_active=\n
++A: power/wakeup_active_count=\n
++A: power/wakeup_count=\n
++A: power/wakeup_expire_count=\n
++A: power/wakeup_last_time_ms=\n
++A: power/wakeup_max_time_ms=\n
++A: power/wakeup_total_time_ms=\n
++A: product=USB2.1 Hub\n
++A: quirks=0x0\n
++A: removable=removable\n
++A: rx_lanes=1\n
++A: speed=480\n
++A: tx_lanes=1\n
++A: urbnum=409\n
++A: version= 2.10\n
++
++P: /devices/pci0000:00/0000:00:08.1/0000:0f:00.3/usb7
++N: bus/usb/007/001=12010002090001406B1D020018060302010109021900010100E0000904000001090000000705810304000C
++E: BUSNUM=007
++E: CURRENT_TAGS=:seat:
++E: DEVNAME=/dev/bus/usb/007/001
++E: DEVNUM=001
++E: DEVTYPE=usb_device
++E: DRIVER=usb
++E: ID_AUTOSUSPEND=1
++E: ID_BUS=usb
++E: ID_FOR_SEAT=usb-pci-0000_0f_00_3
++E: ID_MODEL=xHCI_Host_Controller
++E: ID_MODEL_ENC=xHCI\x20Host\x20Controller
++E: ID_MODEL_FROM_DATABASE=2.0 root hub
++E: ID_MODEL_ID=0002
++E: ID_PATH=pci-0000:0f:00.3
++E: ID_PATH_TAG=pci-0000_0f_00_3
++E: ID_REVISION=0618
++E: ID_SERIAL=Linux_6.18.60-1-lts_xhci-hcd_xHCI_Host_Controller_0000:0f:00.3
++E: ID_SERIAL_SHORT=0000:0f:00.3
++E: ID_USB_INTERFACES=:090000:
++E: ID_USB_MODEL=xHCI_Host_Controller
++E: ID_USB_MODEL_ENC=xHCI\x20Host\x20Controller
++E: ID_USB_MODEL_ID=0002
++E: ID_USB_REVISION=0618
++E: ID_USB_SERIAL=Linux_6.18.60-1-lts_xhci-hcd_xHCI_Host_Controller_0000:0f:00.3
++E: ID_USB_SERIAL_SHORT=0000:0f:00.3
++E: ID_USB_VENDOR=Linux_6.18.60-1-lts_xhci-hcd
++E: ID_USB_VENDOR_ENC=Linux\x206.18.60-1-lts\x20xhci-hcd
++E: ID_USB_VENDOR_ID=1d6b
++E: ID_VENDOR=Linux_6.18.60-1-lts_xhci-hcd
++E: ID_VENDOR_ENC=Linux\x206.18.60-1-lts\x20xhci-hcd
++E: ID_VENDOR_FROM_DATABASE=Linux Foundation
++E: ID_VENDOR_ID=1d6b
++E: MAJOR=189
++E: MINOR=768
++E: PRODUCT=1d6b/2/618
++E: SUBSYSTEM=usb
++E: TAGS=:seat:
++E: TYPE=9/0/1
++A: authorized=1\n
++A: authorized_default=1\n
++A: avoid_reset_quirk=0\n
++A: bConfigurationValue=1\n
++A: bDeviceClass=09\n
++A: bDeviceProtocol=01\n
++A: bDeviceSubClass=00\n
++A: bMaxPacketSize0=64\n
++A: bMaxPower=0mA\n
++A: bNumConfigurations=1\n
++A: bNumInterfaces= 1\n
++A: bcdDevice=0618\n
++A: bmAttributes=e0\n
++A: busnum=7\n
++A: configuration=
++H: descriptors=12010002090001406B1D020018060302010109021900010100E0000904000001090000000705810304000C
++A: dev=189:768\n
++A: devnum=1\n
++A: devpath=0\n
++L: driver=../../../../../bus/usb/drivers/usb
++L: firmware_node=../../../../LNXSYSTM:00/LNXSYBUS:00/PNP0A08:00/device:28/device:2a/device:2b
++A: idProduct=0002\n
++A: idVendor=1d6b\n
++A: interface_authorized_default=1\n
++A: ltm_capable=no\n
++A: manufacturer=Linux 6.18.60-1-lts xhci-hcd\n
++A: maxchild=4\n
++A: power/active_duration=5694670\n
++A: power/autosuspend=0\n
++A: power/autosuspend_delay_ms=0\n
++A: power/connected_duration=5694670\n
++A: power/control=auto\n
++A: power/level=auto\n
++A: power/runtime_active_time=5694668\n
++A: power/runtime_status=active\n
++A: power/runtime_suspended_time=0\n
++A: power/wakeup=disabled\n
++A: power/wakeup_abort_count=\n
++A: power/wakeup_active=\n
++A: power/wakeup_active_count=\n
++A: power/wakeup_count=\n
++A: power/wakeup_expire_count=\n
++A: power/wakeup_last_time_ms=\n
++A: power/wakeup_max_time_ms=\n
++A: power/wakeup_total_time_ms=\n
++A: product=xHCI Host Controller\n
++A: quirks=0x0\n
++A: removable=unknown\n
++A: rx_lanes=1\n
++A: serial=0000:0f:00.3\n
++A: speed=480\n
++A: tx_lanes=1\n
++A: urbnum=36\n
++A: version= 2.00\n
++
++P: /devices/pci0000:00/0000:00:08.1/0000:0f:00.3
++E: DRIVER=xhci_hcd
++E: ID_MODEL_FROM_DATABASE=Matisse USB 3.0 Host Controller
++E: ID_PATH=pci-0000:0f:00.3
++E: ID_PATH_TAG=pci-0000_0f_00_3
++E: ID_PCI_CLASS_FROM_DATABASE=Serial bus controller
++E: ID_PCI_INTERFACE_FROM_DATABASE=XHCI
++E: ID_PCI_SUBCLASS_FROM_DATABASE=USB controller
++E: ID_VENDOR_FROM_DATABASE=Advanced Micro Devices, Inc. [AMD]
++E: MODALIAS=pci:v00001022d0000149Csv00001043sd000087C0bc0Csc03i30
++E: PCI_CLASS=C0330
++E: PCI_ID=1022:149C
++E: PCI_SLOT_NAME=0000:0f:00.3
++E: PCI_SUBSYS_ID=1043:87C0
++E: SUBSYSTEM=pci
++A: aer/correctable_ratelimit_burst=10\n
++A: aer/correctable_ratelimit_interval_ms=1500\n
++A: aer/nonfatal_ratelimit_burst=10\n
++A: aer/nonfatal_ratelimit_interval_ms=1500\n
++A: aer_dev_correctable=RxErr 0\nBadTLP 0\nBadDLLP 0\nRollover 0\nTimeout 0\nNonFatalErr 0\nCorrIntErr 0\nHeaderOF 0\nTOTAL_ERR_COR 0\n
++A: aer_dev_fatal=Undefined 0\nDLP 0\nSDES 0\nTLP 0\nFCP 0\nCmpltTO 0\nCmpltAbrt 0\nUnxCmplt 0\nRxOF 0\nMalfTLP 0\nECRC 0\nUnsupReq 0\nACSViol 0\nUncorrIntErr 0\nBlockedTLP 0\nAtomicOpBlocked 0\nTLPBlockedErr 0\nPoisonTLPBlocked 0\nDMWrReqBlocked 0\nIDECheck 0\nMisIDETLP 0\nPCRC_CHECK 0\nTLPXlatBlocked 0\nTOTAL_ERR_FATAL 0\n
++A: aer_dev_nonfatal=Undefined 0\nDLP 0\nSDES 0\nTLP 0\nFCP 0\nCmpltTO 0\nCmpltAbrt 0\nUnxCmplt 0\nRxOF 0\nMalfTLP 0\nECRC 0\nUnsupReq 0\nACSViol 0\nUncorrIntErr 0\nBlockedTLP 0\nAtomicOpBlocked 0\nTLPBlockedErr 0\nPoisonTLPBlocked 0\nDMWrReqBlocked 0\nIDECheck 0\nMisIDETLP 0\nPCRC_CHECK 0\nTLPXlatBlocked 0\nTOTAL_ERR_NONFATAL 0\n
++A: ari_enabled=0\n
++A: broken_parity_status=0\n
++A: class=0x0c0330\n
++H: config=22109C14070410000030030C10008000040090FC0000000000000000000000000000000000000000000000004310C087000000004800000000000000FF0300000000000000000000095008004310C087016403C80000000000000000000000003120000010A00200A18F00103F293900040D400040000411000000000000000000000000000000001F100100000000001E00800100000100000000000000000005C08600000000000000000000000000000000000000000000000000000000001100078000E00F0000F00F00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000B000115010001010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000100022A00000000000000003020460000200000002000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000D000137000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000170001000502000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
++A: consistent_dma_mask_bits=64\n
++A: current_link_speed=16.0 GT/s PCIe\n
++A: current_link_width=16\n
++A: d3cold_allowed=1\n
++A: dbc=disabled\n
++A: dbc_bInterfaceProtocol=01\n
++A: dbc_bcdDevice=0010\n
++A: dbc_idProduct=0010\n
++A: dbc_idVendor=1d6b\n
++A: dbc_poll_interval_ms=64\n
++A: device=0x149c\n
++A: dma_mask_bits=64\n
++L: driver=../../../../bus/pci/drivers/xhci_hcd
++A: driver_override=(null)\n
++A: enable=1\n
++L: firmware_node=../../../LNXSYSTM:00/LNXSYBUS:00/PNP0A08:00/device:28/device:2a
++L: iommu=../../0000:00:00.2/iommu/ivhd0
++L: iommu_group=../../../../kernel/iommu_groups/34
++A: irq=64\n
++A: link/l0s_aspm=0\n
++A: link/l1_aspm=0\n
++A: local_cpulist=0-11\n
++A: local_cpus=fff\n
++A: max_link_speed=16.0 GT/s PCIe\n
++A: max_link_width=16\n
++A: modalias=pci:v00001022d0000149Csv00001043sd000087C0bc0Csc03i30\n
++A: msi_bus=1\n
++A: msi_irqs/65=msix\n
++A: msi_irqs/66=msix\n
++A: msi_irqs/67=msix\n
++A: msi_irqs/68=msix\n
++A: msi_irqs/69=msix\n
++A: msi_irqs/70=msix\n
++A: msi_irqs/71=msix\n
++A: msi_irqs/72=msix\n
++A: numa_node=-1\n
++A: pools=poolinfo - 0.1\nbuffer-2048         0    0 2048  0\nbuffer-512          0    0  512  0\nbuffer-128          0    0  128  0\nbuffer-32           0    0   32  0\nxHCI 256 port bw ctx arrays    0    0  256  0\nxHCI 1KB stream ctx arrays    0    0 1024  0\nxHCI 256 byte stream ctx arrays    0    0  256  0\nxHCI input/output contexts   34   35 2112 35\nxHCI ring segments  113  113 4096 113\nbuffer-2048       124  124 2048 62\nbuffer-512         40   40  512  5\nbuffer-128        115  128  128  4\nbuffer-32          10  128   32  1\n
++A: power/control=on\n
++A: power/runtime_active_time=5694858\n
++A: power/runtime_status=active\n
++A: power/runtime_suspended_time=0\n
++A: power/wakeup=enabled\n
++A: power/wakeup_abort_count=0\n
++A: power/wakeup_active=0\n
++A: power/wakeup_active_count=0\n
++A: power/wakeup_count=0\n
++A: power/wakeup_expire_count=0\n
++A: power/wakeup_last_time_ms=0\n
++A: power/wakeup_max_time_ms=0\n
++A: power/wakeup_total_time_ms=0\n
++A: power_state=D0\n
++A: reset_method=pm\n
++A: resource=0x00000000fc900000 0x00000000fc9fffff 0x0000000000140204\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n
++A: revision=0x00\n
++A: subsystem_device=0x87c0\n
++A: subsystem_vendor=0x1043\n
++A: vendor=0x1022\n
++
++P: /devices/pci0000:00/0000:00:08.1
++E: DRIVER=pcieport
++E: ID_MODEL_FROM_DATABASE=Starship/Matisse Internal PCIe GPP Bridge 0 to bus[E:B]
++E: ID_PATH=pci-0000:00:08.1
++E: ID_PATH_TAG=pci-0000_00_08_1
++E: ID_PCI_CLASS_FROM_DATABASE=Bridge
++E: ID_PCI_INTERFACE_FROM_DATABASE=Normal decode
++E: ID_PCI_SUBCLASS_FROM_DATABASE=PCI bridge
++E: ID_VENDOR_FROM_DATABASE=Advanced Micro Devices, Inc. [AMD]
++E: MODALIAS=pci:v00001022d00001484sv00001043sd00008808bc06sc04i00
++E: PCI_CLASS=60400
++E: PCI_ID=1022:1484
++E: PCI_SLOT_NAME=0000:00:08.1
++E: PCI_SUBSYS_ID=1043:8808
++E: SUBSYSTEM=pci
++A: aer/correctable_ratelimit_burst=10\n
++A: aer/correctable_ratelimit_interval_ms=1500\n
++A: aer/nonfatal_ratelimit_burst=10\n
++A: aer/nonfatal_ratelimit_interval_ms=1500\n
++A: aer_dev_correctable=RxErr 0\nBadTLP 0\nBadDLLP 0\nRollover 0\nTimeout 0\nNonFatalErr 0\nCorrIntErr 0\nHeaderOF 0\nTOTAL_ERR_COR 0\n
++A: aer_dev_fatal=Undefined 0\nDLP 0\nSDES 0\nTLP 0\nFCP 0\nCmpltTO 0\nCmpltAbrt 0\nUnxCmplt 0\nRxOF 0\nMalfTLP 0\nECRC 0\nUnsupReq 0\nACSViol 0\nUncorrIntErr 0\nBlockedTLP 0\nAtomicOpBlocked 0\nTLPBlockedErr 0\nPoisonTLPBlocked 0\nDMWrReqBlocked 0\nIDECheck 0\nMisIDETLP 0\nPCRC_CHECK 0\nTLPXlatBlocked 0\nTOTAL_ERR_FATAL 0\n
++A: aer_dev_nonfatal=Undefined 0\nDLP 0\nSDES 0\nTLP 0\nFCP 0\nCmpltTO 0\nCmpltAbrt 0\nUnxCmplt 0\nRxOF 0\nMalfTLP 0\nECRC 0\nUnsupReq 0\nACSViol 0\nUncorrIntErr 0\nBlockedTLP 0\nAtomicOpBlocked 0\nTLPBlockedErr 0\nPoisonTLPBlocked 0\nDMWrReqBlocked 0\nIDECheck 0\nMisIDETLP 0\nPCRC_CHECK 0\nTLPXlatBlocked 0\nTOTAL_ERR_NONFATAL 0\n
++A: aer_rootport_total_err_cor=0\n
++A: aer_rootport_total_err_fatal=0\n
++A: aer_rootport_total_err_nonfatal=0\n
++A: ari_enabled=0\n
++A: broken_parity_status=0\n
++A: class=0x060400\n
++H: config=221084140704100000000406100081000000000000000000000F0F00F101000090FCB0FCF1FF01000000000000000000000000005000000000000000FF01120000000000000000000000000000000000015803C80000000010A04200228000003F290000040D7000400C04310000000000004000100001000000000000100100000000001E00800144001F00000000000000000000000000000000000000000005C081000000E0FE0000000000000000000000000000000000000000000000000DC8000043100888080003A8000000000000000000000000000000000000000000000000FFFFFFFF0000000000000000000000000000000000000000000000000B000115010001010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000100022700000000000000003020460000000000002000000000000000000000000000000000000000000000070000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001900012A00000000000000007F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F000000000D000140030001000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000250001410100008001000080000000002600014400000000000000000F00000000000000000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF2700010000000000389C0000389C0000389C0000389C0000389C0000389C0000389C0000389C0000389C0000389C0000389C0000389C0000389C0000389C0000389C0000389C00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
++A: consistent_dma_mask_bits=32\n
++A: current_link_speed=16.0 GT/s PCIe\n
++A: current_link_width=16\n
++A: d3cold_allowed=1\n
++A: device=0x1484\n
++A: dma_mask_bits=32\n
++L: driver=../../../bus/pci/drivers/pcieport
++A: driver_override=(null)\n
++A: enable=2\n
++L: firmware_node=../../LNXSYSTM:00/LNXSYBUS:00/PNP0A08:00/device:28
++L: iommu=../0000:00:00.2/iommu/ivhd0
++L: iommu_group=../../../kernel/iommu_groups/11
++A: irq=33\n
++A: local_cpulist=0-11\n
++A: local_cpus=fff\n
++A: max_link_speed=16.0 GT/s PCIe\n
++A: max_link_width=16\n
++A: modalias=pci:v00001022d00001484sv00001043sd00008808bc06sc04i00\n
++A: msi_bus=1\n
++A: msi_irqs/33=msi\n
++A: numa_node=-1\n
++A: power/autosuspend_delay_ms=100\n
++A: power/control=auto\n
++A: power/runtime_active_time=5694865\n
++A: power/runtime_status=active\n
++A: power/runtime_suspended_time=0\n
++A: power/wakeup=enabled\n
++A: power/wakeup_abort_count=0\n
++A: power/wakeup_active=0\n
++A: power/wakeup_active_count=0\n
++A: power/wakeup_count=0\n
++A: power/wakeup_expire_count=0\n
++A: power/wakeup_last_time_ms=0\n
++A: power/wakeup_max_time_ms=0\n
++A: power/wakeup_total_time_ms=0\n
++A: power_state=D0\n
++A: reset_method=pm\n
++A: resource=0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x00000000fc900000 0x00000000fcbfffff 0x0000000000000200\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n
++A: revision=0x00\n
++A: secondary_bus_number=15\n
++A: subordinate_bus_number=15\n
++A: subsystem_device=0x8808\n
++A: subsystem_vendor=0x1043\n
++A: vendor=0x1022\n
++
+diff --git a/tests/meson.build b/tests/meson.build
+index aad0675..aa03780 100644
+--- a/tests/meson.build
++++ b/tests/meson.build
+@@ -32,6 +32,7 @@ installed_tests_testdir = datadir / 'installed-tests' / versioned_libname
+ installed_tests_libdir = libdir
+ 
+ drivers_tests = {
++    'betterlife': {},
+     'aes2501': { 'timeout': 20 },
+     'aes2550': {},
+     'aes3500': {},
