@@ -1,0 +1,7 @@
+libfprint/
+.venv/
+__pycache__/
+logs/
+experiments/lf-test/
+*.pyc
+*.pkg.tar.zst

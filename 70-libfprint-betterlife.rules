@@ -1,0 +1,2 @@
+# Betterlife (BLESTECH) USB fingerprint module 347d:0302
+SUBSYSTEM=="usb", ATTRS{idVendor}=="347d", ATTRS{idProduct}=="0302", MODE="0660", TAG+="uaccess"

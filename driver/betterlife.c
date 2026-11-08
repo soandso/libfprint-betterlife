@@ -1,0 +1,1163 @@
+/*
+ * Betterlife (BLESTECH) match-on-chip USB fingerprint module, 347d:0302
+ *
+ * The module (Nations N32G4FR MCU + sensor) does enrollment, template storage
+ * and matching itself. The host talks to it over a framed, CRC-protected
+ * protocol; after an SM2 key exchange, all fingerprint commands are SM4
+ * encrypted. Protocol reverse-engineered from the vendor Windows driver for
+ * interoperability (see docs/PROTOCOL.md in the libfprint-betterlife project).
+ *
+ * Frame:  AA | L (LE32) | IV (16) | body | CRC32 (LE, over AA..body)
+ *         L = 20 + len(body); all-zero IV = plaintext body
+ * Body:   4C | cmd | p1 | 00 | p2 | p3 | datalen (LE32) | data | zero pad to 16
+ * Crypto: K_msg = SM4_enc(session_key, IV); body = SM4-ECB(K_msg, body)
+ *
+ * SAFETY: the module also implements template removal (including "remove
+ * all"), firmware update, mode switch to the bootloader, JTAG and MCU restore.
+ * btl_cmd_allowed() is an allowlist: only the exact command shapes the vendor
+ * driver uses for init / enroll / identify can ever be transmitted.
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ */
+
+#define FP_COMPONENT "betterlife"
+
+#include <string.h>
+
+#include <openssl/core_names.h>
+#include <openssl/evp.h>
+#include <openssl/rand.h>
+
+#include "drivers_api.h"
+#include "fpi-byte-utils.h"
+#include "betterlife.h"
+
+struct _FpiDeviceBetterlife
+{
+  FpDevice    parent;
+
+  EVP_PKEY   *sm2_key;
+  guint8      session_key[BTL_KEY_LEN];
+  gboolean    have_session;
+
+  GByteArray *rx;
+
+  /* pending reply */
+  guint8      want_cmd;
+  guint8      want_p1;
+  gboolean    want_data;            /* ignore frames without payload (acks/echoes) */
+  guint       want_timeout;
+  GCancellable *want_cancel;
+  void        (*want_cb) (FpiDeviceBetterlife *self,
+                          const guint8        *data,
+                          gsize                len,
+                          GError              *error);
+
+  FpiSsm     *task_ssm;
+  guint       resync_tries;
+  guint       enroll_needed;
+  guint       enroll_done;
+  GError     *pending_error;        /* reported after a module-side cancel */
+  guint8      identity[BTL_IDENTITY_LEN];
+};
+
+G_DEFINE_TYPE (FpiDeviceBetterlife, fpi_device_betterlife, FP_TYPE_DEVICE)
+
+typedef void (*BtlReplyCb) (FpiDeviceBetterlife *self,
+                            const guint8        *data,
+                            gsize                len,
+                            GError              *error);
+
+static const FpIdEntry id_table[] = {
+  { .vid = 0x347D, .pid = 0x0302, },
+  { .vid = 0, .pid = 0, .driver_data = 0 },
+};
+
+/* ------------------------------------------------------------------ safety */
+
+typedef struct
+{
+  guint8   cmd;
+  guint8   p1;
+  gboolean encrypt;
+  gsize    len;
+} BtlAllowed;
+
+/* Every command shape the driver may send. Anything else (0xB2 remove
+ * incl. remove-all, 0xB4-0xB6, 0xC2 JTAG, 0xC3 restore MCU, 0xD0 firmware
+ * update, 0xD1 bootloader switch, ...) is refused before it reaches USB. */
+static const BtlAllowed btl_allowed[] = {
+  { BTL_CMD_FW_VERSION, 0, FALSE, 0 },
+  { BTL_CMD_SCHEME, 0, FALSE, 0 },
+  { BTL_CMD_KEY_EXCHANGE, 0, FALSE, 65 },
+  { BTL_CMD_COUNT, 0, TRUE, 0 },
+  { BTL_CMD_IDENTIFY, BTL_IDENTIFY_START, TRUE, 0 },
+  { BTL_CMD_IDENTIFY, BTL_IDENTIFY_CANCEL, TRUE, 0 },
+  { BTL_CMD_ENROLL, BTL_ENROLL_START, TRUE, 1 },
+  { BTL_CMD_ENROLL, BTL_ENROLL_TOUCH, TRUE, 1 },
+  { BTL_CMD_ENROLL, BTL_ENROLL_FINISH, TRUE, BTL_IDENTITY_LEN },
+  { BTL_CMD_ENROLL, BTL_ENROLL_CANCEL, TRUE, 1 },
+};
+
+static gboolean
+btl_cmd_allowed (guint8 cmd, guint8 p1, gboolean encrypt, gsize len)
+{
+  for (gsize i = 0; i < G_N_ELEMENTS (btl_allowed); i++)
+    if (btl_allowed[i].cmd == cmd && btl_allowed[i].p1 == p1 &&
+        btl_allowed[i].encrypt == encrypt && btl_allowed[i].len == len)
+      return TRUE;
+  return FALSE;
+}
+
+/* ------------------------------------------------------------------ crypto */
+
+static guint32
+btl_crc32 (const guint8 *buf, gsize len)
+{
+  guint32 crc = 0xFFFFFFFF;
+
+  for (gsize i = 0; i < len; i++)
+    {
+      crc ^= buf[i];
+      for (int k = 0; k < 8; k++)
+        crc = (crc >> 1) ^ (0xEDB88320 & (0u - (crc & 1)));
+    }
+  return ~crc;
+}
+
+static gboolean
+btl_sm4_ecb (const guint8 *key, gboolean encrypt, const guint8 *in,
+             guint8 *out, gsize len)
+{
+  EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new ();
+  gboolean ok = FALSE;
+  int n1 = 0, n2 = 0;
+
+  if (!ctx)
+    return FALSE;
+  if (EVP_CipherInit_ex (ctx, EVP_sm4_ecb (), NULL, key, NULL, encrypt) == 1 &&
+      EVP_CIPHER_CTX_set_padding (ctx, 0) == 1 &&
+      EVP_CipherUpdate (ctx, out, &n1, in, len) == 1 &&
+      EVP_CipherFinal_ex (ctx, out + n1, &n2) == 1 &&
+      (gsize) (n1 + n2) == len)
+    ok = TRUE;
+  EVP_CIPHER_CTX_free (ctx);
+  return ok;
+}
+
+/* Per-message key: SM4 of the IV under the session key. */
+static gboolean
+btl_crypt_body (FpiDeviceBetterlife *self, const guint8 *iv, gboolean encrypt,
+                const guint8 *in, guint8 *out, gsize len)
+{
+  guint8 kmsg[BTL_KEY_LEN];
+  gboolean ok;
+
+  if (!btl_sm4_ecb (self->session_key, TRUE, iv, kmsg, BTL_KEY_LEN))
+    return FALSE;
+  ok = btl_sm4_ecb (kmsg, encrypt, in, out, len);
+  OPENSSL_cleanse (kmsg, sizeof kmsg);
+  return ok;
+}
+
+static void
+der_put_int (GByteArray *a, const guint8 *be32)
+{
+  gsize i = 0;
+  guint8 hdr[3];
+  guint n = 0;
+
+  while (i < 31 && be32[i] == 0)
+    i++;
+  hdr[n++] = 0x02;
+  hdr[n++] = (32 - i) + ((be32[i] & 0x80) ? 1 : 0);
+  if (be32[i] & 0x80)
+    hdr[n++] = 0x00;
+  g_byte_array_append (a, hdr, n);
+  g_byte_array_append (a, be32 + i, 32 - i);
+}
+
+/* The module sends 04 || C1.x || C1.y || C3 (SM3) || C2: GM/T 0003 SM2
+ * ciphertext in C1C3C2 order. OpenSSL wants the ASN.1 SM2Ciphertext form. */
+static gboolean
+btl_sm2_decrypt_session_key (FpiDeviceBetterlife *self, const guint8 *ct,
+                             gsize len, GError **error)
+{
+  g_autoptr(GByteArray) body = g_byte_array_new ();
+  g_autoptr(GByteArray) der = g_byte_array_new ();
+  EVP_PKEY_CTX *ctx = NULL;
+  guint8 out[64];
+  size_t outlen = sizeof out;
+  guint8 hdr[2];
+  gboolean ok = FALSE;
+
+  if (len < 1 + 64 + 32 + BTL_KEY_LEN || ct[0] != 0x04)
+    {
+      g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+                   "Bad key exchange reply (%" G_GSIZE_FORMAT " bytes)", len);
+      return FALSE;
+    }
+
+  der_put_int (body, ct + 1);
+  der_put_int (body, ct + 33);
+  hdr[0] = 0x04; hdr[1] = 32;
+  g_byte_array_append (body, hdr, 2);
+  g_byte_array_append (body, ct + 65, 32);
+  hdr[0] = 0x04; hdr[1] = BTL_KEY_LEN;
+  g_byte_array_append (body, hdr, 2);
+  g_byte_array_append (body, ct + 97, BTL_KEY_LEN);
+  hdr[0] = 0x30; hdr[1] = body->len;          /* always < 128 */
+  g_byte_array_append (der, hdr, 2);
+  g_byte_array_append (der, body->data, body->len);
+
+  ctx = EVP_PKEY_CTX_new_from_pkey (NULL, self->sm2_key, NULL);
+  if (ctx && EVP_PKEY_decrypt_init (ctx) == 1 &&
+      EVP_PKEY_decrypt (ctx, out, &outlen, der->data, der->len) == 1 &&
+      outlen == BTL_KEY_LEN)
+    {
+      memcpy (self->session_key, out, BTL_KEY_LEN);
+      self->have_session = TRUE;
+      ok = TRUE;
+    }
+  else
+    {
+      g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+                   "SM2 decryption of the session key failed");
+    }
+  OPENSSL_cleanse (out, sizeof out);
+  EVP_PKEY_CTX_free (ctx);
+  return ok;
+}
+
+/* -------------------------------------------------------------- transport */
+
+static void btl_read_more (FpiDeviceBetterlife *self);
+
+static void
+btl_deliver (FpiDeviceBetterlife *self, const guint8 *data, gsize len,
+             GError *error)
+{
+  BtlReplyCb cb = self->want_cb;
+
+  self->want_cb = NULL;
+  g_clear_object (&self->want_cancel);
+  if (cb)
+    cb (self, data, len, error);
+  else if (error)
+    g_error_free (error);
+}
+
+/* Parse one complete frame. Returns FALSE (and logs) if it must be dropped. */
+static gboolean
+btl_parse_frame (FpiDeviceBetterlife *self, const guint8 *f, gsize flen,
+                 guint8 *cmd, guint8 *p1, GByteArray *payload)
+{
+  g_autofree guint8 *body = NULL;
+  gsize blen;
+  guint32 dlen;
+  gboolean enc = FALSE;
+
+  if (btl_crc32 (f, flen - 4) != FP_READ_UINT32_LE (f + flen - 4))
+    {
+      fp_warn ("Dropping frame with bad CRC");
+      return FALSE;
+    }
+  blen = flen - BTL_HDR_LEN - 4;
+  if (blen < BTL_BODY_HDR_LEN)
+    return FALSE;
+  for (int i = 0; i < BTL_IV_LEN; i++)
+    enc |= f[5 + i] != 0;
+
+  body = g_malloc (blen);
+  if (enc)
+    {
+      if (!self->have_session || blen % 16 != 0 ||
+          !btl_crypt_body (self, f + 5, FALSE, f + BTL_HDR_LEN, body, blen))
+        {
+          fp_warn ("Dropping encrypted frame that cannot be decrypted");
+          return FALSE;
+        }
+    }
+  else
+    {
+      memcpy (body, f + BTL_HDR_LEN, blen);
+    }
+
+  if (body[0] != BTL_MAGIC)
+    {
+      fp_warn ("Dropping frame with bad body magic 0x%02x", body[0]);
+      return FALSE;
+    }
+  dlen = FP_READ_UINT32_LE (body + 6);
+  if (dlen > blen - BTL_BODY_HDR_LEN)
+    {
+      fp_warn ("Dropping frame with bad data length %u", dlen);
+      return FALSE;
+    }
+  *cmd = body[1];
+  *p1 = body[2];
+  g_byte_array_append (payload, body + BTL_BODY_HDR_LEN, dlen);
+  fp_dbg ("<< cmd %02X p1 %u len %u%s", *cmd, *p1, dlen, enc ? " (enc)" : "");
+  return TRUE;
+}
+
+/* Consume buffered bytes. Returns TRUE if the pending reply was delivered. */
+static gboolean
+btl_process_rx (FpiDeviceBetterlife *self)
+{
+  while (self->rx->len >= 5)
+    {
+      guint32 flen;
+      guint8 cmd, p1;
+      g_autoptr(GByteArray) payload = NULL;
+      g_autofree guint8 *frame = NULL;
+
+      if (self->rx->data[0] != BTL_SYNC)
+        {
+          guint skip = 1;
+          while (skip < self->rx->len && self->rx->data[skip] != BTL_SYNC)
+            skip++;
+          fp_dbg ("Dropping %u bytes of noise", skip);
+          g_byte_array_remove_range (self->rx, 0, skip);
+          continue;
+        }
+      flen = FP_READ_UINT32_LE (self->rx->data + 1) + 5;
+      if (flen < BTL_HDR_LEN + BTL_BODY_HDR_LEN + 4 || flen > BTL_MAX_FRAME)
+        {
+          g_byte_array_remove_range (self->rx, 0, 1);
+          continue;
+        }
+      if (self->rx->len < flen)
+        return FALSE;
+
+      frame = g_memdup2 (self->rx->data, flen);
+      g_byte_array_remove_range (self->rx, 0, flen);
+      payload = g_byte_array_new ();
+      if (!btl_parse_frame (self, frame, flen, &cmd, &p1, payload))
+        continue;
+
+      if (self->want_cb && cmd == self->want_cmd && p1 == self->want_p1 &&
+          (payload->len > 0 || !self->want_data))
+        {
+          btl_deliver (self, payload->data, payload->len, NULL);
+          return TRUE;
+        }
+      fp_dbg ("Ignoring frame cmd %02X p1 %u (%u bytes)", cmd, p1, payload->len);
+    }
+  return FALSE;
+}
+
+static void
+btl_read_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data,
+             GError *error)
+{
+  FpiDeviceBetterlife *self = FPI_DEVICE_BETTERLIFE (dev);
+
+  if (error)
+    {
+      btl_deliver (self, NULL, 0, error);
+      return;
+    }
+  fp_dbg ("read %" G_GSSIZE_FORMAT " bytes", transfer->actual_length);
+  g_byte_array_append (self->rx, transfer->buffer, transfer->actual_length);
+  if (!btl_process_rx (self))
+    btl_read_more (self);
+}
+
+static void
+btl_read_more (FpiDeviceBetterlife *self)
+{
+  FpiUsbTransfer *transfer = fpi_usb_transfer_new (FP_DEVICE (self));
+
+  /* Frames are never a multiple of 64 bytes long, so a big read always ends
+   * on a short packet at the end of a frame. */
+  fpi_usb_transfer_fill_bulk (transfer, BTL_EP_IN, BTL_MAX_FRAME);
+  fpi_usb_transfer_submit (transfer, self->want_timeout, self->want_cancel,
+                           btl_read_cb, NULL);
+}
+
+static void
+btl_expect (FpiDeviceBetterlife *self, guint8 cmd, guint8 p1, gboolean want_data,
+            guint timeout_ms, GCancellable *cancellable, BtlReplyCb cb)
+{
+  g_assert (self->want_cb == NULL);
+  self->want_cmd = cmd;
+  self->want_p1 = p1;
+  self->want_data = want_data;
+  self->want_timeout = timeout_ms;
+  self->want_cancel = cancellable ? g_object_ref (cancellable) : NULL;
+  self->want_cb = cb;
+  if (!btl_process_rx (self))
+    btl_read_more (self);
+}
+
+static void
+btl_send_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data,
+             GError *error)
+{
+  FpiDeviceBetterlife *self = FPI_DEVICE_BETTERLIFE (dev);
+
+  if (error)
+    {
+      btl_deliver (self, NULL, 0, error);
+      return;
+    }
+  if (!btl_process_rx (self))
+    btl_read_more (self);
+}
+
+/* Send a command and wait for the reply frame with the same cmd/p1. */
+static void
+btl_cmd (FpiDeviceBetterlife *self, guint8 cmd, guint8 p1,
+         const guint8 *data, gsize len, gboolean encrypt, gboolean want_data,
+         guint timeout_ms, BtlReplyCb cb)
+{
+  FpiUsbTransfer *transfer;
+  gsize blen = BTL_BODY_HDR_LEN + len;
+  gsize flen;
+  g_autofree guint8 *body = NULL;
+  guint8 *f;
+
+  g_assert (self->want_cb == NULL);
+
+  if (!btl_cmd_allowed (cmd, p1, encrypt, len))
+    {
+      /* Programming error; never send. */
+      cb (self, NULL, 0,
+          fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
+                                    "Refusing to send command %02X/%u", cmd, p1));
+      return;
+    }
+  if (encrypt && !self->have_session)
+    {
+      cb (self, NULL, 0,
+          fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL, "No session key"));
+      return;
+    }
+
+  blen = (blen + 15) & ~(gsize) 15;
+  body = g_malloc0 (blen);
+  body[0] = BTL_MAGIC;
+  body[1] = cmd;
+  body[2] = p1;
+  FP_WRITE_UINT32_LE (body + 6, len);
+  if (len)
+    memcpy (body + BTL_BODY_HDR_LEN, data, len);
+
+  flen = BTL_HDR_LEN + blen + 4;
+  transfer = fpi_usb_transfer_new (FP_DEVICE (self));
+  fpi_usb_transfer_fill_bulk (transfer, BTL_EP_OUT, flen);
+  f = transfer->buffer;
+  memset (f, 0, flen);
+  f[0] = BTL_SYNC;
+  FP_WRITE_UINT32_LE (f + 1, 20 + blen);
+  if (encrypt)
+    {
+      if (RAND_bytes (f + 5, BTL_IV_LEN) != 1 ||
+          !btl_crypt_body (self, f + 5, TRUE, body, f + BTL_HDR_LEN, blen))
+        {
+          fpi_usb_transfer_unref (transfer);
+          cb (self, NULL, 0,
+              fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL, "Encryption failed"));
+          return;
+        }
+    }
+  else
+    {
+      memcpy (f + BTL_HDR_LEN, body, blen);
+    }
+  FP_WRITE_UINT32_LE (f + flen - 4, btl_crc32 (f, flen - 4));
+
+  fp_dbg (">> cmd %02X p1 %u len %" G_GSIZE_FORMAT "%s", cmd, p1, len,
+          encrypt ? " (enc)" : "");
+
+  self->want_cmd = cmd;
+  self->want_p1 = p1;
+  self->want_data = want_data;
+  self->want_timeout = timeout_ms;
+  self->want_cancel = NULL;
+  self->want_cb = cb;
+  fpi_usb_transfer_submit (transfer, 1000, NULL, btl_send_cb, NULL);
+}
+
+/* ------------------------------------------------------------- helpers */
+
+static GError *
+btl_status_error (guint8 st, const char *what)
+{
+  return fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+                                   "%s failed with module status 0x%02x", what, st);
+}
+
+/* Map a per-touch status to a retry hint, or NULL if it is a hard error. */
+static GError *
+btl_status_retry (guint8 st)
+{
+  switch (st)
+    {
+    case BTL_ST_NO_FINGER:
+    case BTL_ST_FINGER_AWAY:
+    case BTL_ST_LIFT_TOO_FAST:
+      return fpi_device_retry_new (FP_DEVICE_RETRY_TOO_SHORT);
+
+    case BTL_ST_OVERLAP:
+    case BTL_ST_AREA_SMALL:
+      return fpi_device_retry_new (FP_DEVICE_RETRY_CENTER_FINGER);
+
+    case BTL_ST_TOO_WET:
+    case BTL_ST_TOO_DRY:
+    case BTL_ST_POOR_QUALITY:
+    case BTL_ST_NOT_LIVE:
+    case BTL_ST_ALGO_FAILED:
+      return fpi_device_retry_new (FP_DEVICE_RETRY_GENERAL);
+
+    default:
+      return NULL;
+    }
+}
+
+static gboolean
+btl_is_cancelled (GError *error)
+{
+  return g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED);
+}
+
+static void
+btl_ssm_next_cb (FpiDeviceBetterlife *self, const guint8 *data, gsize len,
+                 GError *error)
+{
+  if (error)
+    fpi_ssm_mark_failed (self->task_ssm, error);
+  else
+    fpi_ssm_next_state (self->task_ssm);
+}
+
+/* Print data: (q template id, ay tag[16], ay identity[32]) */
+static void
+btl_print_set_data (FpPrint *print, guint16 tid, const guint8 *tag,
+                    const guint8 *identity)
+{
+  GVariant *v;
+
+  v = g_variant_new ("(q@ay@ay)", tid,
+                     g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, tag, BTL_TAG_LEN, 1),
+                     g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, identity,
+                                                BTL_IDENTITY_LEN, 1));
+  fpi_print_set_type (print, FPI_PRINT_RAW);
+  fpi_print_set_device_stored (print, TRUE);
+  g_object_set (print, "fpi-data", v, NULL);
+}
+
+static gboolean
+btl_print_matches (FpPrint *print, guint16 tid, const guint8 *tag)
+{
+  g_autoptr(GVariant) data = NULL;
+  g_autoptr(GVariant) vtag = NULL;
+  g_autoptr(GVariant) vid = NULL;
+  const guint8 *ptag;
+  gsize n = 0;
+  guint16 ptid;
+
+  g_object_get (print, "fpi-data", &data, NULL);
+  if (!data || !g_variant_check_format_string (data, "(q@ay@ay)", FALSE))
+    return FALSE;
+  g_variant_get (data, "(q@ay@ay)", &ptid, &vtag, &vid);
+  ptag = g_variant_get_fixed_array (vtag, &n, 1);
+  return n == BTL_TAG_LEN && ptid == tid && memcmp (ptag, tag, BTL_TAG_LEN) == 0;
+}
+
+/* ------------------------------------------------------------------ open */
+
+enum {
+  OPEN_RESYNC,
+  OPEN_SCHEME,
+  OPEN_KEY_EXCHANGE,
+  OPEN_STATES,
+};
+
+static void open_run_state (FpiSsm *ssm, FpDevice *dev);
+
+static void
+open_fw_cb (FpiDeviceBetterlife *self, const guint8 *data, gsize len,
+            GError *error)
+{
+  /* After a previous user left the module mid-operation, or after the USB data
+   * toggles got out of step, the first frames may be dropped or echoed back.
+   * The firmware query is read-only and fits one packet, so just retry. */
+  if ((error && g_error_matches (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_TIMED_OUT)) ||
+      (!error && len < 7))
+    {
+      g_clear_error (&error);
+      if (++self->resync_tries < 6)
+        {
+          fp_dbg ("No firmware reply, resyncing (attempt %u)", self->resync_tries);
+          g_byte_array_set_size (self->rx, 0);
+          open_run_state (self->task_ssm, FP_DEVICE (self));
+          return;
+        }
+      fpi_ssm_mark_failed (self->task_ssm,
+                           fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+                                                     "Module does not answer"));
+      return;
+    }
+  if (error)
+    {
+      fpi_ssm_mark_failed (self->task_ssm, error);
+      return;
+    }
+  fp_info ("Betterlife module: project %02x%02x, firmware %02x.%02x.%02x.%02x, crypto %u",
+           data[1], data[2], data[3], data[4], data[5], data[6], data[0]);
+  fpi_ssm_next_state (self->task_ssm);
+}
+
+static void
+open_scheme_cb (FpiDeviceBetterlife *self, const guint8 *data, gsize len,
+                GError *error)
+{
+  if (error)
+    {
+      fpi_ssm_mark_failed (self->task_ssm, error);
+      return;
+    }
+  /* [1] 0 = SM2, [2] 0 = SM4-ECB: the only scheme this driver implements */
+  if (len < 4 || data[1] != 0 || data[2] != 0)
+    {
+      fpi_ssm_mark_failed (self->task_ssm,
+                           fpi_device_error_new_msg (FP_DEVICE_ERROR_NOT_SUPPORTED,
+                                                     "Unsupported crypto scheme"));
+      return;
+    }
+  fpi_ssm_next_state (self->task_ssm);
+}
+
+static void
+open_key_cb (FpiDeviceBetterlife *self, const guint8 *data, gsize len,
+             GError *error)
+{
+  if (!error)
+    btl_sm2_decrypt_session_key (self, data, len, &error);
+  if (error)
+    fpi_ssm_mark_failed (self->task_ssm, error);
+  else
+    fpi_ssm_next_state (self->task_ssm);
+}
+
+static void
+open_run_state (FpiSsm *ssm, FpDevice *dev)
+{
+  FpiDeviceBetterlife *self = FPI_DEVICE_BETTERLIFE (dev);
+
+  switch (fpi_ssm_get_cur_state (ssm))
+    {
+    case OPEN_RESYNC:
+      btl_cmd (self, BTL_CMD_FW_VERSION, 0, NULL, 0, FALSE, TRUE, 700, open_fw_cb);
+      break;
+
+    case OPEN_SCHEME:
+      btl_cmd (self, BTL_CMD_SCHEME, 0, NULL, 0, FALSE, TRUE, 2000, open_scheme_cb);
+      break;
+
+    case OPEN_KEY_EXCHANGE:
+      {
+        guint8 pub[65];
+        size_t publen = 0;
+
+        EVP_PKEY_free (self->sm2_key);
+        self->sm2_key = EVP_PKEY_Q_keygen (NULL, NULL, "SM2");
+        if (!self->sm2_key ||
+            EVP_PKEY_get_octet_string_param (self->sm2_key,
+                                             OSSL_PKEY_PARAM_ENCODED_PUBLIC_KEY,
+                                             pub, sizeof pub, &publen) != 1 ||
+            publen != 65 || pub[0] != 0x04)
+          {
+            fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
+                                                                "SM2 key generation failed"));
+            return;
+          }
+        btl_cmd (self, BTL_CMD_KEY_EXCHANGE, 0, pub, publen, FALSE, TRUE, 3000,
+                 open_key_cb);
+      }
+      break;
+    }
+}
+
+static void
+open_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
+{
+  FpiDeviceBetterlife *self = FPI_DEVICE_BETTERLIFE (dev);
+
+  self->task_ssm = NULL;
+  if (error)
+    g_usb_device_release_interface (fpi_device_get_usb_device (dev), 0, 0, NULL);
+  fpi_device_open_complete (dev, error);
+}
+
+static void
+betterlife_open (FpDevice *dev)
+{
+  FpiDeviceBetterlife *self = FPI_DEVICE_BETTERLIFE (dev);
+  GError *error = NULL;
+
+  /* No SET_CONFIGURATION here on purpose: the module does not reset its data
+   * toggle on it, which makes it silently drop packets. */
+  if (!g_usb_device_claim_interface (fpi_device_get_usb_device (dev), 0, 0, &error))
+    {
+      fpi_device_open_complete (dev, error);
+      return;
+    }
+
+  g_byte_array_set_size (self->rx, 0);
+  self->have_session = FALSE;
+  self->resync_tries = 0;
+  self->task_ssm = fpi_ssm_new (dev, open_run_state, OPEN_STATES);
+  fpi_ssm_start (self->task_ssm, open_ssm_done);
+}
+
+static void
+betterlife_close (FpDevice *dev)
+{
+  FpiDeviceBetterlife *self = FPI_DEVICE_BETTERLIFE (dev);
+  GError *error = NULL;
+
+  OPENSSL_cleanse (self->session_key, sizeof self->session_key);
+  self->have_session = FALSE;
+  g_clear_pointer (&self->sm2_key, EVP_PKEY_free);
+  g_usb_device_release_interface (fpi_device_get_usb_device (dev), 0, 0, &error);
+  fpi_device_close_complete (dev, error);
+}
+
+/* ---------------------------------------------------------------- enroll */
+
+enum {
+  ENROLL_COUNT,
+  ENROLL_START,
+  ENROLL_TOUCH,
+  ENROLL_WAIT,
+  ENROLL_FINISH,
+  ENROLL_CANCEL,            /* only entered via jump_to_state */
+  ENROLL_STATES,
+};
+
+static void
+enroll_count_cb (FpiDeviceBetterlife *self, const guint8 *data, gsize len,
+                 GError *error)
+{
+  guint count, max;
+
+  if (error)
+    {
+      fpi_ssm_mark_failed (self->task_ssm, error);
+      return;
+    }
+  if (len < 4)
+    {
+      fpi_ssm_mark_failed (self->task_ssm, btl_status_error (0xFF, "Template count"));
+      return;
+    }
+  count = FP_READ_UINT16_LE (data);
+  max = FP_READ_UINT16_LE (data + 2);
+  fp_info ("Templates on module: %u of %u", count, max);
+  if (max && count >= max)
+    {
+      fpi_ssm_mark_failed (self->task_ssm,
+                           fpi_device_error_new (FP_DEVICE_ERROR_DATA_FULL));
+      return;
+    }
+  fpi_ssm_next_state (self->task_ssm);
+}
+
+static void
+enroll_start_cb (FpiDeviceBetterlife *self, const guint8 *data, gsize len,
+                 GError *error)
+{
+  if (error)
+    {
+      fpi_ssm_mark_failed (self->task_ssm, error);
+      return;
+    }
+  if (len < 2 || data[0] != BTL_ST_OK)
+    {
+      fpi_ssm_mark_failed (self->task_ssm,
+                           btl_status_error (len ? data[0] : 0xFF, "Enroll start"));
+      return;
+    }
+  self->enroll_needed = data[1] ? data[1] : BTL_DEFAULT_ENROLL_STAGES;
+  if (self->enroll_needed != (guint) fp_device_get_nr_enroll_stages (FP_DEVICE (self)))
+    fp_warn ("Module wants %u touches, reporting progress for %d",
+             self->enroll_needed, fp_device_get_nr_enroll_stages (FP_DEVICE (self)));
+  self->enroll_done = 0;
+  fpi_ssm_next_state (self->task_ssm);
+}
+
+static void
+enroll_touch_result_cb (FpiDeviceBetterlife *self, const guint8 *data,
+                        gsize len, GError *error)
+{
+  FpDevice *dev = FP_DEVICE (self);
+  GError *retry;
+
+  fpi_device_report_finger_status_changes (dev, FP_FINGER_STATUS_NONE,
+                                           FP_FINGER_STATUS_NEEDED);
+  if (error)
+    {
+      if (btl_is_cancelled (error))
+        {
+          /* tell the module, then report the cancellation */
+          self->pending_error = error;
+          fpi_ssm_jump_to_state (self->task_ssm, ENROLL_CANCEL);
+          return;
+        }
+      fpi_ssm_mark_failed (self->task_ssm, error);
+      return;
+    }
+
+  fp_dbg ("Touch result: status 0x%02x", data[0]);
+  if (data[0] == BTL_ST_OK)
+    {
+      gint stages = fp_device_get_nr_enroll_stages (dev);
+
+      self->enroll_done++;
+      fp_dbg ("Touch %u/%u accepted", self->enroll_done, self->enroll_needed);
+      fpi_device_enroll_progress (dev,
+                                  MIN ((gint) self->enroll_done, stages - 1),
+                                  NULL, NULL);
+      if (self->enroll_done >= self->enroll_needed)
+        fpi_ssm_jump_to_state (self->task_ssm, ENROLL_FINISH);
+      else
+        fpi_ssm_jump_to_state (self->task_ssm, ENROLL_TOUCH);
+      return;
+    }
+
+  if (data[0] == BTL_ST_DUPLICATE)
+    {
+      self->pending_error = fpi_device_error_new (FP_DEVICE_ERROR_DATA_DUPLICATE);
+      fpi_ssm_jump_to_state (self->task_ssm, ENROLL_CANCEL);
+      return;
+    }
+
+  retry = btl_status_retry (data[0]);
+  if (!retry)
+    {
+      self->pending_error = btl_status_error (data[0], "Enroll touch");
+      fpi_ssm_jump_to_state (self->task_ssm, ENROLL_CANCEL);
+      return;
+    }
+  fp_dbg ("Touch rejected, status 0x%02x", data[0]);
+  /* the module only advances on accepted touches: resend the same index */
+  fpi_device_enroll_progress (dev, self->enroll_done, NULL, retry);
+  fpi_ssm_jump_to_state (self->task_ssm, ENROLL_TOUCH);
+}
+
+static void
+enroll_finish_cb (FpiDeviceBetterlife *self, const guint8 *data, gsize len,
+                  GError *error)
+{
+  FpDevice *dev = FP_DEVICE (self);
+  FpPrint *print = NULL;
+  guint16 tid;
+
+  if (error)
+    {
+      fpi_ssm_mark_failed (self->task_ssm, error);
+      return;
+    }
+  if (len < 3 + BTL_TAG_LEN || data[0] != BTL_ST_OK)
+    {
+      fpi_ssm_mark_failed (self->task_ssm,
+                           btl_status_error (len ? data[0] : 0xFF, "Enroll finish"));
+      return;
+    }
+  tid = FP_READ_UINT16_LE (data + 1);
+  fp_info ("Stored as template %u", tid);
+
+  fpi_device_get_enroll_data (dev, &print);
+  btl_print_set_data (print, tid, data + 3, self->identity);
+  fpi_ssm_mark_completed (self->task_ssm);
+}
+
+static void
+enroll_cancel_cb (FpiDeviceBetterlife *self, const guint8 *data, gsize len,
+                  GError *error)
+{
+  if (error)
+    fp_warn ("Module enroll cancel failed: %s", error->message);
+  g_clear_error (&error);
+  fpi_ssm_mark_failed (self->task_ssm, g_steal_pointer (&self->pending_error));
+}
+
+static void
+enroll_run_state (FpiSsm *ssm, FpDevice *dev)
+{
+  FpiDeviceBetterlife *self = FPI_DEVICE_BETTERLIFE (dev);
+  guint8 b;
+
+  switch (fpi_ssm_get_cur_state (ssm))
+    {
+    case ENROLL_COUNT:
+      btl_cmd (self, BTL_CMD_COUNT, 0, NULL, 0, TRUE, TRUE, 2000, enroll_count_cb);
+      break;
+
+    case ENROLL_START:
+      b = 0;
+      btl_cmd (self, BTL_CMD_ENROLL, BTL_ENROLL_START, &b, 1, TRUE, TRUE, 3000,
+               enroll_start_cb);
+      break;
+
+    case ENROLL_TOUCH:
+      /* Data = 1-based index of this touch (the Windows driver's
+       * SET_CUR_ENROLLED_TIMES counter). The module acks immediately. */
+      b = MIN (self->enroll_done + 1, 255);
+      btl_cmd (self, BTL_CMD_ENROLL, BTL_ENROLL_TOUCH, &b, 1, TRUE, FALSE, 3000,
+               btl_ssm_next_cb);
+      break;
+
+    case ENROLL_WAIT:
+      fpi_device_report_finger_status_changes (dev, FP_FINGER_STATUS_NEEDED,
+                                               FP_FINGER_STATUS_NONE);
+      btl_expect (self, BTL_CMD_ENROLL, BTL_ENROLL_TOUCH, TRUE, 0,
+                  fpi_device_get_cancellable (dev), enroll_touch_result_cb);
+      break;
+
+    case ENROLL_FINISH:
+      if (RAND_bytes (self->identity, BTL_IDENTITY_LEN) != 1)
+        {
+          fpi_ssm_mark_failed (ssm, fpi_device_error_new (FP_DEVICE_ERROR_GENERAL));
+          return;
+        }
+      btl_cmd (self, BTL_CMD_ENROLL, BTL_ENROLL_FINISH, self->identity,
+               BTL_IDENTITY_LEN, TRUE, TRUE, 8000, enroll_finish_cb);
+      break;
+
+    case ENROLL_CANCEL:
+      b = 0;
+      g_byte_array_set_size (self->rx, 0);
+      btl_cmd (self, BTL_CMD_ENROLL, BTL_ENROLL_CANCEL, &b, 1, TRUE, TRUE, 3000,
+               enroll_cancel_cb);
+      break;
+    }
+}
+
+static void
+enroll_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
+{
+  FpiDeviceBetterlife *self = FPI_DEVICE_BETTERLIFE (dev);
+  FpPrint *print = NULL;
+
+  self->task_ssm = NULL;
+  if (error)
+    {
+      fpi_device_enroll_complete (dev, NULL, error);
+      return;
+    }
+  fpi_device_get_enroll_data (dev, &print);
+  fpi_device_enroll_complete (dev, g_object_ref (print), NULL);
+}
+
+static void
+betterlife_enroll (FpDevice *dev)
+{
+  FpiDeviceBetterlife *self = FPI_DEVICE_BETTERLIFE (dev);
+
+  self->task_ssm = fpi_ssm_new (dev, enroll_run_state, ENROLL_STATES);
+  fpi_ssm_start (self->task_ssm, enroll_ssm_done);
+}
+
+/* ------------------------------------------------------- verify/identify */
+
+enum {
+  MATCH_START,
+  MATCH_WAIT,
+  MATCH_CANCEL,             /* only entered via jump_to_state */
+  MATCH_STATES,
+};
+
+static void
+match_report (FpiDeviceBetterlife *self, gboolean have_match, guint16 tid,
+              const guint8 *tag, GError *retry)
+{
+  FpDevice *dev = FP_DEVICE (self);
+
+  if (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_VERIFY)
+    {
+      FpPrint *print = NULL;
+      FpiMatchResult result = FPI_MATCH_FAIL;
+
+      fpi_device_get_verify_data (dev, &print);
+      if (retry)
+        result = FPI_MATCH_ERROR;
+      else if (have_match && btl_print_matches (print, tid, tag))
+        result = FPI_MATCH_SUCCESS;
+      fpi_device_verify_report (dev, result, NULL, retry);
+    }
+  else
+    {
+      GPtrArray *prints = NULL;
+      FpPrint *match = NULL;
+
+      fpi_device_get_identify_data (dev, &prints);
+      for (guint i = 0; have_match && !retry && i < prints->len; i++)
+        if (btl_print_matches (g_ptr_array_index (prints, i), tid, tag))
+          {
+            match = g_ptr_array_index (prints, i);
+            break;
+          }
+      if (have_match && !match && !retry)
+        fp_info ("Module matched template %u, which belongs to no known print", tid);
+      fpi_device_identify_report (dev, match, NULL, retry);
+    }
+}
+
+static void
+match_result_cb (FpiDeviceBetterlife *self, const guint8 *data, gsize len,
+                 GError *error)
+{
+  GError *retry;
+
+  fpi_device_report_finger_status_changes (FP_DEVICE (self), FP_FINGER_STATUS_NONE,
+                                           FP_FINGER_STATUS_NEEDED);
+  if (error)
+    {
+      if (btl_is_cancelled (error))
+        {
+          self->pending_error = error;
+          fpi_ssm_jump_to_state (self->task_ssm, MATCH_CANCEL);
+          return;
+        }
+      fpi_ssm_mark_failed (self->task_ssm, error);
+      return;
+    }
+
+  fp_dbg ("Identify result: status 0x%02x", data[0]);
+  switch (data[0])
+    {
+    case BTL_ST_OK:
+      if (len < 3 + BTL_TAG_LEN)
+        {
+          fpi_ssm_mark_failed (self->task_ssm, btl_status_error (0xFF, "Identify"));
+          return;
+        }
+      fp_dbg ("Module matched template %u", FP_READ_UINT16_LE (data + 1));
+      match_report (self, TRUE, FP_READ_UINT16_LE (data + 1), data + 3, NULL);
+      break;
+
+    case BTL_ST_NO_MATCH:
+      match_report (self, FALSE, 0, NULL, NULL);
+      break;
+
+    default:
+      retry = btl_status_retry (data[0]);
+      if (!retry)
+        {
+          fpi_ssm_mark_failed (self->task_ssm, btl_status_error (data[0], "Identify"));
+          return;
+        }
+      match_report (self, FALSE, 0, NULL, retry);
+      break;
+    }
+  fpi_ssm_mark_completed (self->task_ssm);
+}
+
+static void
+match_cancel_cb (FpiDeviceBetterlife *self, const guint8 *data, gsize len,
+                 GError *error)
+{
+  if (error)
+    fp_warn ("Module identify cancel failed: %s", error->message);
+  g_clear_error (&error);
+  fpi_ssm_mark_failed (self->task_ssm, g_steal_pointer (&self->pending_error));
+}
+
+static void
+match_run_state (FpiSsm *ssm, FpDevice *dev)
+{
+  FpiDeviceBetterlife *self = FPI_DEVICE_BETTERLIFE (dev);
+
+  switch (fpi_ssm_get_cur_state (ssm))
+    {
+    case MATCH_START:
+      btl_cmd (self, BTL_CMD_IDENTIFY, BTL_IDENTIFY_START, NULL, 0, TRUE, FALSE,
+               3000, btl_ssm_next_cb);
+      break;
+
+    case MATCH_WAIT:
+      fpi_device_report_finger_status_changes (dev, FP_FINGER_STATUS_NEEDED,
+                                               FP_FINGER_STATUS_NONE);
+      btl_expect (self, BTL_CMD_IDENTIFY, BTL_IDENTIFY_START, TRUE, 0,
+                  fpi_device_get_cancellable (dev), match_result_cb);
+      break;
+
+    case MATCH_CANCEL:
+      g_byte_array_set_size (self->rx, 0);
+      btl_cmd (self, BTL_CMD_IDENTIFY, BTL_IDENTIFY_CANCEL, NULL, 0, TRUE, FALSE,
+               3000, match_cancel_cb);
+      break;
+    }
+}
+
+static void
+match_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
+{
+  FpiDeviceBetterlife *self = FPI_DEVICE_BETTERLIFE (dev);
+
+  self->task_ssm = NULL;
+  if (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_VERIFY)
+    fpi_device_verify_complete (dev, error);
+  else
+    fpi_device_identify_complete (dev, error);
+}
+
+static void
+betterlife_match (FpDevice *dev)
+{
+  FpiDeviceBetterlife *self = FPI_DEVICE_BETTERLIFE (dev);
+
+  self->task_ssm = fpi_ssm_new (dev, match_run_state, MATCH_STATES);
+  fpi_ssm_start (self->task_ssm, match_ssm_done);
+}
+
+/* ------------------------------------------------------------------ class */
+
+static void
+fpi_device_betterlife_init (FpiDeviceBetterlife *self)
+{
+  self->rx = g_byte_array_new ();
+}
+
+static void
+fpi_device_betterlife_finalize (GObject *object)
+{
+  FpiDeviceBetterlife *self = FPI_DEVICE_BETTERLIFE (object);
+
+  g_clear_pointer (&self->rx, g_byte_array_unref);
+  g_clear_pointer (&self->sm2_key, EVP_PKEY_free);
+  g_clear_error (&self->pending_error);
+  G_OBJECT_CLASS (fpi_device_betterlife_parent_class)->finalize (object);
+}
+
+static void
+fpi_device_betterlife_class_init (FpiDeviceBetterlifeClass *klass)
+{
+  FpDeviceClass *dev_class = FP_DEVICE_CLASS (klass);
+  GObjectClass *obj_class = G_OBJECT_CLASS (klass);
+
+  obj_class->finalize = fpi_device_betterlife_finalize;
+
+  dev_class->id = FP_COMPONENT;
+  dev_class->full_name = "Betterlife Fingerprint Module";
+  dev_class->type = FP_DEVICE_TYPE_USB;
+  dev_class->scan_type = FP_SCAN_TYPE_PRESS;
+  dev_class->id_table = id_table;
+  dev_class->nr_enroll_stages = BTL_DEFAULT_ENROLL_STAGES;
+  dev_class->temp_hot_seconds = -1;
+
+  dev_class->open = betterlife_open;
+  dev_class->close = betterlife_close;
+  dev_class->enroll = betterlife_enroll;
+  dev_class->verify = betterlife_match;
+  dev_class->identify = betterlife_match;
+
+  fpi_device_class_auto_initialize_features (dev_class);
+}
