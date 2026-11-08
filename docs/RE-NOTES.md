@@ -94,10 +94,13 @@ sends `IOCTL_CUSTOM_END_ENROLL` (0x440410) with the 32-byte account SID.
 22. Driver delete now compares the B3 count before/after and returns DATA_NOT_FOUND on a no-op
     (checked by deleting an already-removed print). Package pkgrel 3.
 
+23. pkgrel 3 installed. `fprintd-delete dave` on the stale print: driver reported DATA_NOT_FOUND
+    (0 before, 0 after), fprintd removed the host print. `fprintd-enroll` right index 7/7,
+    `fprintd-verify` **3/3 match**.
+
 ## Module state after this session
 
-Empty (0 of 10). fprintd still has a host-side print for the right index from step 19, whose module
-template was wiped in step 21; delete it with `fprintd-delete` before re-enrolling.
+1 of 10: the user's fprintd right-index enrollment (template 0).
 
 ## Open problems
 

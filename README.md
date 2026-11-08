@@ -21,7 +21,8 @@ SM4-encrypted after an SM2 key exchange.
 | Delete a print from the module (per-print identity) | ✅ verified |
 | Wipe all templates | ❌ deliberately not implemented (see Safety) |
 | Cancel (module-side cancel command) | implemented, not yet tested |
-| fprintd / PAM | ⏳ package `libfprint-btl-syno` built, fprintd test pending |
+| fprintd enroll / verify / delete | ✅ (`libfprint-btl-syno` pkgrel 3; verify 3/3) |
+| PAM (sudo, lock screen) | ⏳ not configured yet |
 
 ## Safety
 
