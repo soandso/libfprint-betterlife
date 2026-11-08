@@ -11,6 +11,29 @@ The module is **match-on-chip**: an N32G4FR MCU does capture, enrollment, templa
 (10 templates) and matching. The host only sends commands, over a CRC-framed protocol that is
 SM4-encrypted after an SM2 key exchange.
 
+**This is a fork, not upstream libfprint.** The driver is maintained as a patch on top of libfprint
+releases (currently v1.94.100); it is not proposed upstream for now. See
+[`docs/MAINTAINING.md`](docs/MAINTAINING.md).
+
+## How this was made
+
+**AI disclosure:** the reverse engineering, the protocol documentation and all code in this repo
+were produced with **Claude Code** (Anthropic's AI coding agent). A human directed the work, owned
+the hardware, approved every step that writes to the module, and did all the hardware testing, but
+has **not reviewed the code line by line**. Commits carry a `Co-Authored-By: Claude` trailer.
+
+Judge it by the evidence rather than the authorship. [`docs/VALIDATION.md`](docs/VALIDATION.md)
+lists every claim with how it was verified on the real device, the bugs found along the way, and
+what is **not** verified. In short:
+
+- every feature below was observed working on the hardware, through fprintd and PAM;
+- a umockdev test recorded on the device replays without hardware, clean under valgrind;
+- libfprint's full test suite passes with the driver (131/131), and the code passes libfprint's
+  style check;
+- the dangerous module commands (firmware update, bootloader switch, remove-all, …) can't be sent,
+  enforced by tests in both the Python tool and the C driver;
+- tested on **one** unit and firmware (01.00.00.00) only.
+
 ## Status
 
 | Feature | State |
@@ -22,8 +45,10 @@ SM4-encrypted after an SM2 key exchange.
 | Wipe all templates | ❌ deliberately not implemented (see Safety) |
 | Cancel (module-side cancel command) | ✅ verified (identify and enroll) |
 | fprintd enroll / verify / delete | ✅ (verify 3/3) |
-| libfprint umockdev test (recorded on hardware, replays in CI) | ✅ `tests/umockdev/`, valgrind clean |
+| libfprint umockdev test (recorded on hardware, replays without it) | ✅ `tests/umockdev/`, valgrind clean |
 | PAM: KDE lock screen, sudo | ✅ (`scripts/pam-enable.sh`, also polkit + LightDM; undo: `pam-revert.sh`) |
+
+Evidence for each line: [`docs/VALIDATION.md`](docs/VALIDATION.md).
 
 ## Install
 
@@ -49,7 +74,10 @@ lost a reader to an unvetted "clear" command.
 | `tests/` | offline tests (crypto vectors, frame codec, Python and C allowlists) |
 | `experiments/` | interactive hardware tests |
 | `docs/PROTOCOL.md` | the protocol |
-| `docs/RE-NOTES.md` | how it was found, function map, module state |
+| `docs/RE-NOTES.md` | how it was found, function map, session log, module state |
+| `docs/VALIDATION.md` | provenance (AI disclosure), evidence, failures, what isn't verified |
+| `docs/MAINTAINING.md` | keeping the fork on top of new libfprint releases |
+| `tests/umockdev/` | copy of the recorded libfprint test (`custom.py`, recording, device dump) |
 | `scripts/pam-enable.sh`, `pam-revert.sh` | add/remove `pam_fprintd` for sudo, polkit, LightDM (backups in /root) |
 | `70-libfprint-betterlife.rules` | udev rule for the Python tools |
 

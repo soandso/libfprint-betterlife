@@ -1,7 +1,8 @@
 # libfprint-betterlife: project memory
 
 libfprint match-on-chip driver (plus Python RE tooling) for the Betterlife / BLESTECH USB fingerprint
-module `347d:0302`. Spec: `docs/PROTOCOL.md`. RE log + module state: `docs/RE-NOTES.md`.
+module `347d:0302`. Spec: `docs/PROTOCOL.md`. RE log + module state: `docs/RE-NOTES.md`. Evidence + AI disclosure:
+`docs/VALIDATION.md`. Fork maintenance / rebasing: `docs/MAINTAINING.md`. Lives as a fork (not upstreamed).
 Sister project with the same workflow: `../libfprint-synochip` (its first unit was bricked by an
 assumed "clear all" opcode; that is why this project is allowlist-only).
 
@@ -22,6 +23,9 @@ assumed "clear all" opcode; that is why this project is allowlist-only).
   your own command line.
 - Vendor Windows binaries stay out of the repo (scratch dir only).
 - sudo needs the user (`! sudo ...`).
+
+- Keep `docs/VALIDATION.md` truthful: when behaviour changes or something new is verified (or fails),
+  update its tables. Don't claim verification that didn't happen on hardware. Keep the AI disclosure.
 
 ## Dev loop
 - `libfprint/` (gitignored) = upstream v1.94.100 + driver. `meson compile -C libfprint/build`
