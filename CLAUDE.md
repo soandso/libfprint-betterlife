@@ -13,7 +13,8 @@ assumed "clear all" opcode; that is why this project is allowlist-only).
   switch), or `B2` with an all-zero identity (= remove ALL). `B2` is allowed only as p1=1 + an ASCII
   identity (user approved 2026-11-09). Identities MUST be printable ASCII + NUL padding: a binary
   identity leaks a module slot (see PROTOCOL.md "Remove").
-- 10 module slots; 1 is leaked (RE-NOTES "Module state"). Enroll tests should delete what they add.
+- 10 module slots (module wiped once with user approval on 2026-11-09). Enroll tests should delete
+  what they add. `B2` replies 00 even for unknown identities: check the `B3` count.
 - Use `.venv/bin/python -I`. Device access: udev rule `70-libfprint-betterlife.rules` (installed).
 - Don't call pyusb `set_configuration()` on a configured device (data-toggle desync; see PROTOCOL.md).
 - Interactive tests: run in background via `experiments/run.sh <script> <log>`, tell the user exactly

@@ -62,6 +62,7 @@ struct _FpiDeviceBetterlife
   guint       enroll_needed;
   guint       enroll_done;
   GError     *pending_error;        /* reported after a module-side cancel */
+  gint        count_before;         /* template count before a removal */
   guint8      identity[BTL_IDENTITY_LEN];
 };
 
@@ -1184,17 +1185,99 @@ btl_print_get_identity (FpPrint *print, guint8 *identity)
   return TRUE;
 }
 
+/* The remove command answers 00 even if no template carries the identity, so
+ * the template count is compared before and after. */
+enum {
+  DELETE_COUNT_BEFORE,
+  DELETE_REMOVE,
+  DELETE_COUNT_AFTER,
+  DELETE_STATES,
+};
+
+static gint
+btl_parse_count (const guint8 *data, gsize len)
+{
+  return len >= 4 ? (gint) FP_READ_UINT16_LE (data) : -1;
+}
+
 static void
-delete_cb (FpiDeviceBetterlife *self, const guint8 *data, gsize len,
-           GError *error)
+delete_count_before_cb (FpiDeviceBetterlife *self, const guint8 *data, gsize len,
+                        GError *error)
+{
+  if (error)
+    {
+      fpi_ssm_mark_failed (self->task_ssm, error);
+      return;
+    }
+  self->count_before = btl_parse_count (data, len);
+  fpi_ssm_next_state (self->task_ssm);
+}
+
+static void
+delete_remove_cb (FpiDeviceBetterlife *self, const guint8 *data, gsize len,
+                  GError *error)
 {
   if (!error && (len < 1 || data[0] != BTL_ST_OK))
     error = fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_NOT_FOUND,
                                       "Module refused to remove the template (status 0x%02x)",
                                       len ? data[0] : 0xFF);
-  if (!error)
-    fp_info ("Removed template from module");
-  fpi_device_delete_complete (FP_DEVICE (self), error);
+  if (error)
+    fpi_ssm_mark_failed (self->task_ssm, error);
+  else
+    fpi_ssm_next_state (self->task_ssm);
+}
+
+static void
+delete_count_after_cb (FpiDeviceBetterlife *self, const guint8 *data, gsize len,
+                       GError *error)
+{
+  gint after;
+
+  if (error)
+    {
+      fpi_ssm_mark_failed (self->task_ssm, error);
+      return;
+    }
+  after = btl_parse_count (data, len);
+  fp_info ("Templates on module: %d before removal, %d after", self->count_before, after);
+  if (self->count_before >= 0 && after >= self->count_before)
+    {
+      fpi_ssm_mark_failed (self->task_ssm,
+                           fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_NOT_FOUND,
+                                                     "No module template carries this print's identity"));
+      return;
+    }
+  fpi_ssm_mark_completed (self->task_ssm);
+}
+
+static void
+delete_run_state (FpiSsm *ssm, FpDevice *dev)
+{
+  FpiDeviceBetterlife *self = FPI_DEVICE_BETTERLIFE (dev);
+
+  switch (fpi_ssm_get_cur_state (ssm))
+    {
+    case DELETE_COUNT_BEFORE:
+      btl_cmd (self, BTL_CMD_COUNT, 0, NULL, 0, TRUE, TRUE, 2000, delete_count_before_cb);
+      break;
+
+    case DELETE_REMOVE:
+      /* Removes the module template(s) enrolled under this print's identity. */
+      btl_cmd (self, BTL_CMD_REMOVE, BTL_REMOVE_IDENTITY, self->identity,
+               BTL_IDENTITY_LEN, TRUE, TRUE, 5000, delete_remove_cb);
+      break;
+
+    case DELETE_COUNT_AFTER:
+      btl_cmd (self, BTL_CMD_COUNT, 0, NULL, 0, TRUE, TRUE, 2000, delete_count_after_cb);
+      break;
+    }
+}
+
+static void
+delete_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
+{
+  FPI_DEVICE_BETTERLIFE (dev)->task_ssm = NULL;
+  fpi_device_delete_complete (dev, error);
 }
 
 static void
@@ -1202,19 +1285,18 @@ betterlife_delete (FpDevice *dev)
 {
   FpiDeviceBetterlife *self = FPI_DEVICE_BETTERLIFE (dev);
   FpPrint *print = NULL;
-  guint8 identity[BTL_IDENTITY_LEN];
 
   fpi_device_get_delete_data (dev, &print);
-  if (!btl_print_get_identity (print, identity))
+  if (!btl_print_get_identity (print, self->identity))
     {
       fpi_device_delete_complete (dev,
                                   fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID,
                                                             "Print has no module identity"));
       return;
     }
-  /* Removes the module template(s) enrolled under this print's identity. */
-  btl_cmd (self, BTL_CMD_REMOVE, BTL_REMOVE_IDENTITY, identity, BTL_IDENTITY_LEN,
-           TRUE, TRUE, 5000, delete_cb);
+  self->count_before = -1;
+  self->task_ssm = fpi_ssm_new (dev, delete_run_state, DELETE_STATES);
+  fpi_ssm_start (self->task_ssm, delete_ssm_done);
 }
 
 /* Only here so that libfprint advertises FP_DEVICE_FEATURE_STORAGE, which makes

@@ -109,7 +109,9 @@ do this) → `A1` → SM2 keygen → `A2` → `C0` → `C1`.
   deleted user, or **32 zero bytes when its own database became empty → removes every template**.
   `p1=0` ("Single" in the device DLL's log) has no sender.
 - `p1=1` + identity removes the templates enrolled (B0 finish) under that identity → `00`; the count
-  drops at once and the finger stops matching.
+  drops at once and the finger stops matching. **The reply is `00` even when no template carries the
+  identity**, so success can only be seen in the `B3` count (the driver compares before/after).
+- `p1=1` + 32 zero bytes: verified once (user-approved one-off, 2026-11-09): count 2 → 0. Remove-all.
 - ⚠ The firmware treats the identity as a **C string**. With an ASCII identity + NUL padding removal
   is clean. With 32 random binary bytes the module replied `00` but only erased the record (identify
   then returned the template with tag `ff…ff`), the count did not drop, and the slot stayed used

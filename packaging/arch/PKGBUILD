@@ -6,7 +6,7 @@
 pkgname=libfprint-btl-syno
 _pkgname=libfprint
 pkgver=1.94.100
-pkgrel=2
+pkgrel=3
 pkgdesc="Library for fingerprint readers (with Synochip 2f50:0100 and Betterlife 347d:0302 drivers)"
 url="https://fprint.freedesktop.org/"
 arch=(x86_64)
@@ -43,7 +43,7 @@ source=("git+https://gitlab.freedesktop.org/libfprint/libfprint.git#tag=v$pkgver
         "0002-add-betterlife-driver.patch")
 b2sums=('SKIP'
         'b96e2eb2e2fecf801a0c89e229c5948d58af27e2e9cefec45db90e31028b3451c0dc9f74274a2346131efc191c8d2ebf59b94486d1dc6f06206c872f6eb04e7f'
-        '31b3c85db760fb4e61cf6d632e597d8370abb4c441c40555b282572d096138879b00afef43023700d3e2d5d3a2b6e941cff4c654b48329c1592480cb65ca3679')
+        '915f63cfb201e9cddac6498e8c5e29344d6fb78de3b7e565bef89292c524710fbab2816d7c4abc4ea2cb4008a187cf8c30e80d181114e4e22f415259baf3d1e4')
 
 prepare() {
   cd $_pkgname

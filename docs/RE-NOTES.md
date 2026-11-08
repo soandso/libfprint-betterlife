@@ -82,17 +82,25 @@ sends `IOCTL_CUSTOM_END_ENROLL` (0x440410) with the 32-byte account SID.
     delete + (list or clear_storage). The driver implements clear_storage as NOT_SUPPORTED (sends
     nothing) to get that flag; fprintd then only warns before a first enrollment.
 
+19. Package pkgrel 2 installed; fprintd-enroll right index 7/7 → template 0. fprintd-verify: 2 of 7
+    matched. fprintd debug (`G_MESSAGES_DEBUG=libfprint-betterlife` drop-in): the module recognised
+    the finger every time (status 00) but returned the **leaked template 2** (also right index) in
+    2 of 3 → the driver correctly rejected it. So the zombie still matched; the earlier post-replug
+    "no match" was a false reject.
+20. `B2/1` + 32×`FF` (guessing the erased identity; temporary Python-only exception, reverted):
+    reply `00`, count unchanged. ⇒ B2 always answers 00.
+21. One-off remove-all (`B2/1` + 32 zero bytes, user-approved, temporary exception reverted
+    immediately): count 2 → 0. Module answers normally afterwards.
+22. Driver delete now compares the B3 count before/after and returns DATA_NOT_FOUND on a no-op
+    (checked by deleting an already-removed print). Package pkgrel 3.
+
 ## Module state after this session
 
-| Template | Finger | Notes |
-|---|---|---|
-| 2 | right index | **leaked**: identity erased by the binary-identity delete, no longer matches, still counted |
-
-1 of 10 slots used; it can only be reclaimed by a remove-all, which stays blocked.
+Empty (0 of 10). fprintd still has a host-side print for the right index from step 19, whose module
+template was wiped in step 21; delete it with `fprintd-delete` before re-enrolling.
 
 ## Open problems
 
-- The leaked slot (see above).
 - libfprint's `examples/verify` takes its device-storage path once STORAGE is advertised and fails
   without `list`; use `experiments/lf_verify_delete.py` or fprintd instead.
 - `A0[0]` (crypto flag) and `A1[0]`/`[3]` semantics beyond what the driver needs.
