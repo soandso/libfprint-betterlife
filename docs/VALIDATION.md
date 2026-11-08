@@ -81,8 +81,14 @@ to clear a leaked template (count 2 → 0).
 - Only **one unit** (`347d:0302`, firmware 01.00.00.00, project code `0x0F`, sensor 112 × 96) was
   tested. The vendor driver also lists `347d:0304` and SPI parts (`BF63112`, `BF61100`); not claimed.
 - Other firmware versions; the vendor driver can update the module firmware (we never do).
-- Coexistence with templates enrolled by Windows on a dual-boot machine (they can't authenticate
-  on Linux, by design, but may cause false rejects like the leaked template did).
+- Dual boot with Windows. Windows templates can't authenticate on Linux (by design) but may cause
+  false rejects, like the leaked template did. Worse: the Windows driver **wipes the whole module**
+  when its own biometric database is empty, which would also remove the Linux templates.
+- Error paths never triggered on hardware (every touch seen was accepted): the retry mappings for
+  the enroll/identify statuses (`11` lifted too fast, `14` overlap, `33`/`34` wet/dry, `35` small
+  area, `36` poor quality, …), the duplicate-finger rejection (`12`), and storage full (10 of 10).
+- System suspend/resume while fprintd has the reader open. USB autosuspend (enabled by the hwdb
+  entry) is exercised: the reader is normally suspended and wakes when fprintd opens it.
 - Long-term reliability; LightDM and polkit PAM paths.
 
 ## Reproduce

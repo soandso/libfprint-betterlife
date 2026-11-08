@@ -468,7 +468,6 @@ btl_read_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data,
       btl_deliver (self, NULL, 0, error);
       return;
     }
-  fp_dbg ("read %" G_GSSIZE_FORMAT " bytes", transfer->actual_length);
   g_byte_array_append (self->rx, transfer->buffer, transfer->actual_length);
   if (!btl_process_rx (self))
     btl_read_more (self);

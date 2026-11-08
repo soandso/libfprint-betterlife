@@ -16,10 +16,10 @@ index dcf2d11..341a4c9 100644
  usb:v1C7Ap0571*
 diff --git a/libfprint/drivers/betterlife/betterlife.c b/libfprint/drivers/betterlife/betterlife.c
 new file mode 100644
-index 0000000..687ecd6
+index 0000000..15d6d2c
 --- /dev/null
 +++ b/libfprint/drivers/betterlife/betterlife.c
-@@ -0,0 +1,1461 @@
+@@ -0,0 +1,1460 @@
 +/*
 + * Betterlife (BLESTECH) match-on-chip USB fingerprint module, 347d:0302
 + *
@@ -490,7 +490,6 @@ index 0000000..687ecd6
 +      btl_deliver (self, NULL, 0, error);
 +      return;
 +    }
-+  fp_dbg ("read %" G_GSSIZE_FORMAT " bytes", transfer->actual_length);
 +  g_byte_array_append (self->rx, transfer->buffer, transfer->actual_length);
 +  if (!btl_process_rx (self))
 +    btl_read_more (self);
