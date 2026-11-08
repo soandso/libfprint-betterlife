@@ -16,10 +16,10 @@ index dcf2d11..341a4c9 100644
  usb:v1C7Ap0571*
 diff --git a/libfprint/drivers/betterlife/betterlife.c b/libfprint/drivers/betterlife/betterlife.c
 new file mode 100644
-index 0000000..2ac742e
+index 0000000..687ecd6
 --- /dev/null
 +++ b/libfprint/drivers/betterlife/betterlife.c
-@@ -0,0 +1,1456 @@
+@@ -0,0 +1,1461 @@
 +/*
 + * Betterlife (BLESTECH) match-on-chip USB fingerprint module, 347d:0302
 + *
@@ -71,24 +71,24 @@ index 0000000..2ac742e
 +  GByteArray *rx;
 +
 +  /* pending reply */
-+  guint8      want_cmd;
-+  guint8      want_p1;
-+  gboolean    want_data;            /* ignore frames without payload (acks/echoes) */
-+  guint       want_timeout;
++  guint8        want_cmd;
++  guint8        want_p1;
++  gboolean      want_data;          /* ignore frames without payload (acks/echoes) */
++  guint         want_timeout;
 +  GCancellable *want_cancel;
-+  void        (*want_cb) (FpiDeviceBetterlife *self,
-+                          const guint8        *data,
-+                          gsize                len,
-+                          GError              *error);
++  void          (*want_cb) (FpiDeviceBetterlife *self,
++                            const guint8        *data,
++                            gsize                len,
++                            GError              *error);
 +
-+  FpiSsm     *task_ssm;
-+  guint       resync_tries;
-+  guint       enroll_needed;
-+  guint       enroll_done;
-+  GError     *pending_error;        /* reported after a module-side cancel */
-+  gint        count_before;         /* template count before a removal */
-+  guint32     emu_counter;          /* emulation (umockdev tests): deterministic "randomness" */
-+  guint8      identity[BTL_IDENTITY_LEN];
++  FpiSsm *task_ssm;
++  guint   resync_tries;
++  guint   enroll_needed;
++  guint   enroll_done;
++  GError *pending_error;            /* reported after a module-side cancel */
++  gint    count_before;             /* template count before a removal */
++  guint32 emu_counter;              /* emulation (umockdev tests): deterministic "randomness" */
++  guint8  identity[BTL_IDENTITY_LEN];
 +};
 +
 +G_DEFINE_TYPE (FpiDeviceBetterlife, fpi_device_betterlife, FP_TYPE_DEVICE)
@@ -264,13 +264,16 @@ index 0000000..2ac742e
 +
 +  der_put_int (body, ct + 1);
 +  der_put_int (body, ct + 33);
-+  hdr[0] = 0x04; hdr[1] = 32;
++  hdr[0] = 0x04;
++  hdr[1] = 32;
 +  g_byte_array_append (body, hdr, 2);
 +  g_byte_array_append (body, ct + 65, 32);
-+  hdr[0] = 0x04; hdr[1] = BTL_KEY_LEN;
++  hdr[0] = 0x04;
++  hdr[1] = BTL_KEY_LEN;
 +  g_byte_array_append (body, hdr, 2);
 +  g_byte_array_append (body, ct + 97, BTL_KEY_LEN);
-+  hdr[0] = 0x30; hdr[1] = body->len;          /* always < 128 */
++  hdr[0] = 0x30;
++  hdr[1] = body->len;                         /* always < 128 */
 +  g_byte_array_append (der, hdr, 2);
 +  g_byte_array_append (der, body->data, body->len);
 +
@@ -704,7 +707,8 @@ index 0000000..2ac742e
 +  OPEN_STATES,
 +};
 +
-+static void open_run_state (FpiSsm *ssm, FpDevice *dev);
++static void open_run_state (FpiSsm   *ssm,
++                            FpDevice *dev);
 +
 +static void
 +open_fw_cb (FpiDeviceBetterlife *self, const guint8 *data, gsize len,
@@ -1100,7 +1104,8 @@ index 0000000..2ac742e
 +  fpi_ssm_start (self->task_ssm, enroll_ssm_done);
 +}
 +
-+static gboolean btl_print_get_identity (FpPrint *print, guint8 *identity);
++static gboolean btl_print_get_identity (FpPrint *print,
++                                        guint8  *identity);
 +
 +/* ------------------------------------------------------- verify/identify */
 +
@@ -1478,7 +1483,7 @@ index 0000000..2ac742e
 +}
 diff --git a/libfprint/drivers/betterlife/betterlife.h b/libfprint/drivers/betterlife/betterlife.h
 new file mode 100644
-index 0000000..0b51a1a
+index 0000000..1db6008
 --- /dev/null
 +++ b/libfprint/drivers/betterlife/betterlife.h
 @@ -0,0 +1,68 @@
@@ -1499,52 +1504,52 @@ index 0000000..0b51a1a
 +#include "fpi-device.h"
 +#include "fpi-ssm.h"
 +
-+#define BTL_EP_OUT              (0x02 | FPI_USB_ENDPOINT_OUT)
-+#define BTL_EP_IN               (0x01 | FPI_USB_ENDPOINT_IN)
++#define BTL_EP_OUT (0x02 | FPI_USB_ENDPOINT_OUT)
++#define BTL_EP_IN (0x01 | FPI_USB_ENDPOINT_IN)
 +
-+#define BTL_SYNC                0xAA
-+#define BTL_MAGIC               0x4C
-+#define BTL_IV_LEN              16
-+#define BTL_KEY_LEN             16
-+#define BTL_HDR_LEN             (1 + 4 + BTL_IV_LEN)   /* AA, L, IV */
-+#define BTL_BODY_HDR_LEN        10                     /* 4C cmd p1 00 p2 p3 len32 */
-+#define BTL_MAX_FRAME           0x4000
++#define BTL_SYNC 0xAA
++#define BTL_MAGIC 0x4C
++#define BTL_IV_LEN 16
++#define BTL_KEY_LEN 16
++#define BTL_HDR_LEN (1 + 4 + BTL_IV_LEN)               /* AA, L, IV */
++#define BTL_BODY_HDR_LEN 10                            /* 4C cmd p1 00 p2 p3 len32 */
++#define BTL_MAX_FRAME 0x4000
 +
-+#define BTL_IDENTITY_LEN        32
-+#define BTL_TAG_LEN             16
++#define BTL_IDENTITY_LEN 32
++#define BTL_TAG_LEN 16
 +
-+#define BTL_CMD_FW_VERSION      0xA0
-+#define BTL_CMD_SCHEME          0xA1
-+#define BTL_CMD_KEY_EXCHANGE    0xA2
-+#define BTL_CMD_ENROLL          0xB0
-+#define BTL_CMD_IDENTIFY        0xB1
-+#define BTL_CMD_REMOVE          0xB2
-+#define BTL_CMD_COUNT           0xB3
++#define BTL_CMD_FW_VERSION 0xA0
++#define BTL_CMD_SCHEME 0xA1
++#define BTL_CMD_KEY_EXCHANGE 0xA2
++#define BTL_CMD_ENROLL 0xB0
++#define BTL_CMD_IDENTIFY 0xB1
++#define BTL_CMD_REMOVE 0xB2
++#define BTL_CMD_COUNT 0xB3
 +
-+#define BTL_ENROLL_START        0
-+#define BTL_ENROLL_TOUCH        1
-+#define BTL_ENROLL_FINISH       2
-+#define BTL_ENROLL_CANCEL       3
-+#define BTL_REMOVE_IDENTITY     1   /* data: 32-byte identity; all-zero = remove ALL (never sent) */
-+#define BTL_IDENTIFY_START      0
-+#define BTL_IDENTIFY_CANCEL     1
++#define BTL_ENROLL_START 0
++#define BTL_ENROLL_TOUCH 1
++#define BTL_ENROLL_FINISH 2
++#define BTL_ENROLL_CANCEL 3
++#define BTL_REMOVE_IDENTITY 1       /* data: 32-byte identity; all-zero = remove ALL (never sent) */
++#define BTL_IDENTIFY_START 0
++#define BTL_IDENTIFY_CANCEL 1
 +
 +/* Status byte (data[0]) of enroll/identify results */
-+#define BTL_ST_OK               0x00
-+#define BTL_ST_NO_FINGER        0x10
-+#define BTL_ST_LIFT_TOO_FAST    0x11
-+#define BTL_ST_DUPLICATE        0x12
-+#define BTL_ST_SAVE_FAILED      0x13
-+#define BTL_ST_OVERLAP          0x14
-+#define BTL_ST_NO_MATCH         0x21
-+#define BTL_ST_FINGER_AWAY      0x30
-+#define BTL_ST_ALGO_FAILED      0x31
-+#define BTL_ST_NOT_LIVE         0x32
-+#define BTL_ST_TOO_WET          0x33
-+#define BTL_ST_TOO_DRY          0x34
-+#define BTL_ST_AREA_SMALL       0x35
-+#define BTL_ST_POOR_QUALITY     0x36
-+#define BTL_ST_FLASH_FAILED     0x41
++#define BTL_ST_OK 0x00
++#define BTL_ST_NO_FINGER 0x10
++#define BTL_ST_LIFT_TOO_FAST 0x11
++#define BTL_ST_DUPLICATE 0x12
++#define BTL_ST_SAVE_FAILED 0x13
++#define BTL_ST_OVERLAP 0x14
++#define BTL_ST_NO_MATCH 0x21
++#define BTL_ST_FINGER_AWAY 0x30
++#define BTL_ST_ALGO_FAILED 0x31
++#define BTL_ST_NOT_LIVE 0x32
++#define BTL_ST_TOO_WET 0x33
++#define BTL_ST_TOO_DRY 0x34
++#define BTL_ST_AREA_SMALL 0x35
++#define BTL_ST_POOR_QUALITY 0x36
++#define BTL_ST_FLASH_FAILED 0x41
 +
 +#define BTL_DEFAULT_ENROLL_STAGES 7
 +

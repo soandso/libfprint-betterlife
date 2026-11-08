@@ -49,24 +49,24 @@ struct _FpiDeviceBetterlife
   GByteArray *rx;
 
   /* pending reply */
-  guint8      want_cmd;
-  guint8      want_p1;
-  gboolean    want_data;            /* ignore frames without payload (acks/echoes) */
-  guint       want_timeout;
+  guint8        want_cmd;
+  guint8        want_p1;
+  gboolean      want_data;          /* ignore frames without payload (acks/echoes) */
+  guint         want_timeout;
   GCancellable *want_cancel;
-  void        (*want_cb) (FpiDeviceBetterlife *self,
-                          const guint8        *data,
-                          gsize                len,
-                          GError              *error);
+  void          (*want_cb) (FpiDeviceBetterlife *self,
+                            const guint8        *data,
+                            gsize                len,
+                            GError              *error);
 
-  FpiSsm     *task_ssm;
-  guint       resync_tries;
-  guint       enroll_needed;
-  guint       enroll_done;
-  GError     *pending_error;        /* reported after a module-side cancel */
-  gint        count_before;         /* template count before a removal */
-  guint32     emu_counter;          /* emulation (umockdev tests): deterministic "randomness" */
-  guint8      identity[BTL_IDENTITY_LEN];
+  FpiSsm *task_ssm;
+  guint   resync_tries;
+  guint   enroll_needed;
+  guint   enroll_done;
+  GError *pending_error;            /* reported after a module-side cancel */
+  gint    count_before;             /* template count before a removal */
+  guint32 emu_counter;              /* emulation (umockdev tests): deterministic "randomness" */
+  guint8  identity[BTL_IDENTITY_LEN];
 };
 
 G_DEFINE_TYPE (FpiDeviceBetterlife, fpi_device_betterlife, FP_TYPE_DEVICE)
@@ -242,13 +242,16 @@ btl_sm2_decrypt_session_key (FpiDeviceBetterlife *self, const guint8 *ct,
 
   der_put_int (body, ct + 1);
   der_put_int (body, ct + 33);
-  hdr[0] = 0x04; hdr[1] = 32;
+  hdr[0] = 0x04;
+  hdr[1] = 32;
   g_byte_array_append (body, hdr, 2);
   g_byte_array_append (body, ct + 65, 32);
-  hdr[0] = 0x04; hdr[1] = BTL_KEY_LEN;
+  hdr[0] = 0x04;
+  hdr[1] = BTL_KEY_LEN;
   g_byte_array_append (body, hdr, 2);
   g_byte_array_append (body, ct + 97, BTL_KEY_LEN);
-  hdr[0] = 0x30; hdr[1] = body->len;          /* always < 128 */
+  hdr[0] = 0x30;
+  hdr[1] = body->len;                         /* always < 128 */
   g_byte_array_append (der, hdr, 2);
   g_byte_array_append (der, body->data, body->len);
 
@@ -682,7 +685,8 @@ enum {
   OPEN_STATES,
 };
 
-static void open_run_state (FpiSsm *ssm, FpDevice *dev);
+static void open_run_state (FpiSsm   *ssm,
+                            FpDevice *dev);
 
 static void
 open_fw_cb (FpiDeviceBetterlife *self, const guint8 *data, gsize len,
@@ -1078,7 +1082,8 @@ betterlife_enroll (FpDevice *dev)
   fpi_ssm_start (self->task_ssm, enroll_ssm_done);
 }
 
-static gboolean btl_print_get_identity (FpPrint *print, guint8 *identity);
+static gboolean btl_print_get_identity (FpPrint *print,
+                                        guint8  *identity);
 
 /* ------------------------------------------------------- verify/identify */
 
