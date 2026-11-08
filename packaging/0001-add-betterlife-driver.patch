@@ -1256,18 +1256,17 @@ index 0000000..fd1d22f
 +G_DECLARE_FINAL_TYPE (FpiDeviceBetterlife, fpi_device_betterlife, FPI,
 +                      DEVICE_BETTERLIFE, FpDevice)
 diff --git a/libfprint/meson.build b/libfprint/meson.build
-index f11533c..3316fb7 100644
+index f11533c..9bc7f4c 100644
 --- a/libfprint/meson.build
 +++ b/libfprint/meson.build
-@@ -136,6 +136,8 @@ driver_sources = {
-     ),
-     'fpcmoc' : files('drivers/fpcmoc/fpc.c'),
-     'realtek' : files('drivers/realtek/realtek.c'),
-+    'betterlife' :
-+        [ 'drivers/betterlife/betterlife.c' ],
-     'focaltech_moc' : files('drivers/focaltech_moc/focaltech_moc.c'),
-     'mafpmoc' : files('drivers/mafpmoc/mafpmoc.c'),
-     'secugen' : files('drivers/secugen.c'),
+@@ -95,6 +95,7 @@ driver_sources = {
+     'upektc' : files('drivers/upektc.c'),
+     'upeksonly' : files('drivers/upeksonly.c'),
+     'uru4000' : files('drivers/uru4000.c'),
++    'betterlife' : files('drivers/betterlife/betterlife.c'),
+     'aes1610' : files('drivers/aes1610.c'),
+     'aes1660' : files('drivers/aes1660.c'),
+     'aes2501' : files('drivers/aes2501.c'),
 diff --git a/meson.build b/meson.build
 index ab09dc1..e06f42d 100644
 --- a/meson.build
