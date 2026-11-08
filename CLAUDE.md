@@ -38,5 +38,6 @@ assumed "clear all" opcode; that is why this project is allowlist-only).
 - Export the patch with `--binary` and include `tests/meson.build tests/betterlife` (git add -N first).
 - `examples/verify` fails with "Device has no storage" (no `list`); use
   `experiments/lf_verify_delete.py` (GI against libfprint/build, needs GI_TYPELIB_PATH/LD_LIBRARY_PATH).
-- Package: `packaging/arch` (`libfprint-btl-syno`, replaces libfprint-synochip). After changing the
-  driver: copy patch to `packaging/arch/0002-…`, update its b2sum + pkgrel, `makepkg -fC --nocheck`.
+- Package: sibling repo `../libfprint-btl-syno` (combined synochip + betterlife, replaces libfprint).
+  It fetches `packaging/0001-add-betterlife-driver.patch` from here by file:// + b2sum. After
+  re-exporting the patch, run `../libfprint-btl-syno/update.sh` (re-pins, bumps pkgrel, builds + tests).

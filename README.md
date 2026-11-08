@@ -21,9 +21,15 @@ SM4-encrypted after an SM2 key exchange.
 | Delete a print from the module (per-print identity) | ✅ verified |
 | Wipe all templates | ❌ deliberately not implemented (see Safety) |
 | Cancel (module-side cancel command) | ✅ verified (identify and enroll) |
-| fprintd enroll / verify / delete | ✅ (`libfprint-btl-syno` pkgrel 3; verify 3/3) |
+| fprintd enroll / verify / delete | ✅ (verify 3/3) |
 | libfprint umockdev test (recorded on hardware, replays in CI) | ✅ `tests/umockdev/`, valgrind clean |
 | PAM: KDE lock screen, sudo | ✅ (`scripts/pam-enable.sh`, also polkit + LightDM; undo: `pam-revert.sh`) |
+
+## Install
+
+The patch applies to libfprint v1.94.100. On Arch, the combined package with this driver and the
+Synochip one is built from the sibling repo `../libfprint-btl-syno` (it fetches
+`packaging/0001-add-betterlife-driver.patch` from here; run its `./update.sh` after changing the driver).
 
 ## Safety
 
@@ -39,7 +45,6 @@ lost a reader to an unvetted "clear" command.
 |---|---|
 | `driver/` | libfprint driver `betterlife.c/.h` (copy of what the patch adds) |
 | `packaging/0001-add-betterlife-driver.patch` | patch against libfprint v1.94.100 |
-| `packaging/arch/` | `libfprint-btl-syno` PKGBUILD: libfprint + synochip + betterlife drivers |
 | `btl.py`, `btlcrypto.py`, `safety.py` | Python userspace driver, pure-Python SM2/SM3/SM4, allowlist |
 | `tests/` | offline tests (crypto vectors, frame codec, Python and C allowlists) |
 | `experiments/` | interactive hardware tests |
