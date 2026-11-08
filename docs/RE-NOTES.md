@@ -115,6 +115,20 @@ sends `IOCTL_CUSTOM_END_ENROLL` (0x440410) with the 32-byte account SID.
     delete). Replay: `meson test betterlife` OK, valgrind 0 leaks / 0 errors, all-drivers suite and
     the package check() 131/131.
 
+27. Docs: AI disclosure + evidence (`VALIDATION.md`), fork maintenance (`MAINTAINING.md`). Decision:
+    the driver lives as a fork; not proposed upstream for now (context: the CS9711 driver's sigfm
+    dependency, MRs !418/!530, has been in review since 2022). Patch applies cleanly to upstream
+    master `6f9479c`, alone and on top of the Synochip patch.
+28. Published: public GitHub repo `soandso/libfprint-betterlife`, release **v0.1.0** (patch asset,
+    checksum verified after download). AUR-ready `packaging/aur/` (builds from the release,
+    131/131), **not** published to the AUR (decision). Another project already supports this reader:
+    `arqueon/betterlife-347d-libfprint` (AUR `libfprint-betterlife-347d-git`, 2026-10-30): adds
+    `347d:0304` (match-on-host, needs OpenCV/SIGFM on top of the CS9711 fork), and its
+    `clear_storage` sends remove-all, so fprintd wipes the module before a first enrollment.
+29. Housekeeping: per-read debug line removed (replay, valgrind, uncrustify re-run); VALIDATION lists
+    the untested paths. Combined package: `update.sh` re-hashed a stale cached `file://` patch, fixed
+    (pkgrel 6). Synochip README got an AI disclosure.
+
 ## Module state after this session
 
 1 of 10: the user's fprintd right-index enrollment (template 0).

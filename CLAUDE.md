@@ -45,3 +45,17 @@ assumed "clear all" opcode; that is why this project is allowlist-only).
 - Package: sibling repo `../libfprint-btl-syno` (combined synochip + betterlife, replaces libfprint).
   It fetches `packaging/0001-add-betterlife-driver.patch` from here by file:// + b2sum. After
   re-exporting the patch, run `../libfprint-btl-syno/update.sh` (re-pins, bumps pkgrel, builds + tests).
+
+## Handoff (end of session 2026-11-09)
+- **Done:** driver works end to end (fprintd, PAM sudo + KDE lock screen, cancel, delete), umockdev
+  test recorded, valgrind/style clean, docs (PROTOCOL, RE-NOTES, VALIDATION, MAINTAINING).
+- **Published:** github.com/soandso/libfprint-betterlife (public), release v0.1.0. `master` is ahead of
+  v0.1.0 only by the debug-line removal + docs. Not on the AUR (decision). Fork, not upstream (decision).
+- **Installed here:** `libfprint-btl-syno` pkgrel 4 (built pkgrel 6 in `../libfprint-btl-syno`, optional
+  install, only removes a debug line). Module holds 1 template: the user's fprintd right index.
+  PAM: `scripts/pam-enable.sh` applied (backups in /root/pam-backup-fprintd-*).
+- **Open (needs the user at the reader):** bad-touch retry statuses, duplicate-finger (`12`),
+  storage full (10/10; delete afterwards), system suspend/resume, LightDM + polkit login.
+- **Open (user):** line-by-line code review. Synochip replacement-unit validation (separate repo).
+- Related: `../libfprint-btl-syno` (combined package, local only, no remote), `../libfprint-synochip`
+  (private). Alternative driver for this reader: arqueon/betterlife-347d-libfprint (see RE-NOTES 28).

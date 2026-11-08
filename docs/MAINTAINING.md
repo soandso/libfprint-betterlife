@@ -69,6 +69,17 @@ AI disclosure that would go with one.
    (re-pins checksums, builds, runs the full test suite), install, restart fprintd, and do one
    `fprintd-verify`.
 
+## Releasing
+
+1. Commit and push `master`; make sure `packaging/0001-add-betterlife-driver.patch` is the export
+   from step 5 above.
+2. `git tag -a vX.Y.Z -m "…" && git push origin vX.Y.Z`, then
+   `gh release create vX.Y.Z packaging/0001-add-betterlife-driver.patch` with notes (base libfprint
+   version, what changed, disclosure link, b2sum/sha256). Download the asset and compare its b2sum.
+3. `packaging/aur/PKGBUILD`: set `_drvver`, the patch b2sum (and `pkgver` if libfprint moved),
+   `pkgrel=1`; `makepkg --printsrcinfo > .SRCINFO`; `makepkg -fC` must pass. (Not published to the
+   AUR; the files are for self-builds.)
+
 ## Rules that must survive every rebase
 
 - The command allowlist (`btl_cmd_allowed()`) and the ASCII-identity rule (`btl_identity_valid()`):
