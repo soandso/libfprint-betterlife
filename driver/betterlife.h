@@ -34,12 +34,14 @@
 #define BTL_CMD_KEY_EXCHANGE    0xA2
 #define BTL_CMD_ENROLL          0xB0
 #define BTL_CMD_IDENTIFY        0xB1
+#define BTL_CMD_REMOVE          0xB2
 #define BTL_CMD_COUNT           0xB3
 
 #define BTL_ENROLL_START        0
 #define BTL_ENROLL_TOUCH        1
 #define BTL_ENROLL_FINISH       2
 #define BTL_ENROLL_CANCEL       3
+#define BTL_REMOVE_IDENTITY     1   /* data: 32-byte identity; all-zero = remove ALL (never sent) */
 #define BTL_IDENTIFY_START      0
 #define BTL_IDENTIFY_CANCEL     1
 

@@ -1,7 +1,8 @@
 # Betterlife 347d:0302 protocol (as recovered)
 
 Status: framing, CRC, SM2/SM4, A0–A2, B0, B1, B3, C0, C1 **verified on hardware** (2026-11-09).
-B2, B4–B6, C2, C3, D0, D1 are known only statically and are **never sent**. Source: vendor Windows WBDI driver
+B2 verified in its per-identity form only. B4–B6, C2, C3, D0, D1 are known only statically and are
+**never sent**. Source: vendor Windows WBDI driver
 `BLESTECH - Biometric - 14.36.53.907` (Microsoft Update Catalog, `usb\vid_347d&pid_0302`; also
 lists `PID_0304`, `ACPI\BF63112`, `ACPI\BF61100`).
 
@@ -64,7 +65,7 @@ Replies use the same body format: `cmd`/`p1` echo the request, `data[0]` is usua
 | A2 | QUERY_ROOT_KEY | no | init | key exchange, see above |
 | B0 | ENROLL_FINGERPRINT | yes | enroll | p1: 0 start, 1 touch, 2 finish, 3 cancel |
 | B1 | IDENTIFY_FINGERPRINT | yes | verify | p1: 0 start, 1 cancel. Result is asynchronous |
-| **B2** | **REMOVE_FINGERPRINT** | yes | delete | **p1=0 single, p1≠0 ALL**. ⚠ blocked |
+| B2 | REMOVE_FINGERPRINT | yes | delete | p1=1 + 32-byte identity, see below. **All-zero identity = remove ALL** ⚠ blocked |
 | B3 | QUERY_FINGERPRINT_COUNT | yes | storage | 2× LE16 |
 | B4 | GET_IMG_DATA | yes | diagnostics | p1: 0 start, 1 upload, 2 cancel. blocked (unneeded) |
 | B5 | DETECT_FINGERPRINT_PRESS | – | **never** | blocked |
@@ -102,6 +103,18 @@ do this) → `A1` → SM2 keygen → `A2` → `C0` → `C1`.
 - `A0` → `01 0f 00 01 00 00 00`; `A1` → `10 00 00 ff` (SM2, SM4-ECB); `C1` → `83 5f 00 00 70 00 60 00 00`
   (chip `0x5F83`, 112 × 96); `B3` → `count LE16, max LE16` = 10 templates max; `C0` → 16 bytes.
 - Replies to encrypted commands reuse the request's IV.
+
+### Remove (B2) — verified
+- Windows (`StorageAdapterDeleteRecord`) only ever sends `p1=1` + 32 bytes: the account SID of the
+  deleted user, or **32 zero bytes when its own database became empty → removes every template**.
+  `p1=0` ("Single" in the device DLL's log) has no sender.
+- `p1=1` + identity removes the templates enrolled (B0 finish) under that identity → `00`; the count
+  drops at once and the finger stops matching.
+- ⚠ The firmware treats the identity as a **C string**. With an ASCII identity + NUL padding removal
+  is clean. With 32 random binary bytes the module replied `00` but only erased the record (identify
+  then returned the template with tag `ff…ff`), the count did not drop, and the slot stayed used
+  after a power cycle (the template no longer matched after replugging). Identities must therefore be
+  printable ASCII + NUL padding; the driver uses `LFP-` + 26 hex digits.
 
 ## USB quirks (verified)
 - **Data toggle:** the firmware does not reset its bulk OUT data toggle on a repeated

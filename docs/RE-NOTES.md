@@ -67,21 +67,34 @@ sends `IOCTL_CUSTOM_END_ENROLL` (0x440410) with the 32-byte account SID.
     verify: 1 false reject, 1 match; right thumb → module matched template 1 → driver rejected (tag
     not in the print) → NO MATCH. Correct.
 
+12. Packaging: combined Arch package `libfprint-btl-syno` (synochip patch unchanged + this driver).
+13. **Delete RE (static):** only sender of the remove IOCTL (0x44041c) is the storage adapter's
+    `DeleteRecord`: `[01] + 32 B`; SID copied in when other host records remain, else left zero →
+    zero identity = wipe. Device DLL maps buf[0] → p1, rest → data.
+14. Test (user-approved): `B2/1 "BTLTEST1"` → `00`, count 3→2; thumb and index still match.
+15. C driver delete with its random binary identity: `00`, but count unchanged and the index still
+    matched with tag `ff…ff`. After unplug/replug: no match, count still 2 → leaked slot.
+16. `B2/1 "BTLTEST2"` → count 2→1, thumb no longer matches. ⇒ identity is a C string.
+17. Driver switched to ASCII identities (`LFP-` + 26 hex); both allowlists require printable ASCII +
+    NUL padding for B0 finish and B2. libfprint: enroll right middle → template 0 (slot reuse),
+    verify MATCH, delete → count 2→1, identify → no match.
+18. fprintd 1.94.5 only deletes on the device if FP_DEVICE_FEATURE_STORAGE, which libfprint sets for
+    delete + (list or clear_storage). The driver implements clear_storage as NOT_SUPPORTED (sends
+    nothing) to get that flag; fprintd then only warns before a first enrollment.
+
 ## Module state after this session
 
-| Template | Finger | Created by | Notes |
-|---|---|---|---|
-| 0 | unknown (user's first test) | Python, wrong touch indices | poor template |
-| 1 | right thumb | Python test (`BTLTEST2`) | |
-| 2 | right index | libfprint enroll example | its print is in `experiments/lf-test/` (gitignored) |
+| Template | Finger | Notes |
+|---|---|---|
+| 2 | right index | **leaked**: identity erased by the binary-identity delete, no longer matches, still counted |
 
-None can be removed without `B2`, which is blocked. 7 of 10 slots are free.
+1 of 10 slots used; it can only be reclaimed by a remove-all, which stays blocked.
 
 ## Open problems
 
-- **Delete.** `B2` p1=0 ("Single") is how Windows deletes a template; its data comes from the storage
-  adapter (not yet analysed: probably the LE16 template id). `B2` with p1≠0 is remove-**all**.
-  Neither is enabled. Without it, every enrollment uses a slot for good (10 total).
+- The leaked slot (see above).
+- libfprint's `examples/verify` takes its device-storage path once STORAGE is advertised and fails
+  without `list`; use `experiments/lf_verify_delete.py` or fprintd instead.
 - `A0[0]` (crypto flag) and `A1[0]`/`[3]` semantics beyond what the driver needs.
 - Enroll touch result byte `[1]` echoes the index; whether it can differ (e.g. module wants more
   touches) is unknown.

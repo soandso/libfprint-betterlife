@@ -25,10 +25,11 @@ class Frames(unittest.TestCase):
 
     def test_encrypted_roundtrip(self):
         k = os.urandom(16)
-        f = btl.build_frame(0xB0, 2, b"x" * 32, True, k)
+        ident = b"BTLTEST9".ljust(32, b"\0")
+        f = btl.build_frame(0xB0, 2, ident, True, k)
         self.assertNotEqual(f[5:21], bytes(16))
         r = btl.parse_frame(f, k)
-        self.assertEqual((r["cmd"], r["p1"], r["data"]), (0xB0, 2, b"x" * 32))
+        self.assertEqual((r["cmd"], r["p1"], r["data"]), (0xB0, 2, ident))
 
     def test_bad_crc(self):
         f = bytearray(btl.build_frame(0xA0))
@@ -46,12 +47,26 @@ class Safety(unittest.TestCase):
                         btl.build_frame(cmd, p1, b"", enc, bytes(16))
 
     def test_clear_all_blocked(self):
-        for data in (b"", b"\x00", b"\x00\x00", b"\xff\xff"):
+        k = bytes(16)
+        for p1 in range(256):
+            for data in (b"", b"\x00", bytes(32), b"\xff\xff", b"\x01" * 31, b"\x01" * 33):
+                with self.assertRaises(UnsafeCommand, msg=f"B2/{p1} {data.hex()}"):
+                    btl.build_frame(0xB2, p1, data, True, k)
+        for p1 in set(range(256)) - {1}:
             with self.assertRaises(UnsafeCommand):
-                btl.build_frame(0xB2, 1, data, True, bytes(16))
+                btl.build_frame(0xB2, p1, b"x".ljust(32, b"\0"), True, k)
+        with self.assertRaises(UnsafeCommand):
+            btl.build_frame(0xB2, 1, b"x".ljust(32, b"\0"), False)     # must be encrypted
+        btl.build_frame(0xB2, 1, b"BTLTEST1".ljust(32, b"\0"), True, k)   # the only allowed shape
+        for bad in (b"\x00" + b"A" * 31, b"A" * 32, b"AB\x00C".ljust(32, b"\0"), b"\x9a\x01".ljust(32, b"\0"),
+                    b"A B".ljust(32, b"\0")):
+            for cmd, p1 in ((0xB2, 1), (0xB0, 2)):
+                with self.assertRaises(UnsafeCommand, msg=bad.hex()):
+                    btl.build_frame(cmd, p1, bad, True, k)
+        btl.build_frame(0xB0, 2, b"LFP-0123456789abcdef0123456789".ljust(32, b"\0"), True, k)
 
     def test_unknown_commands_blocked(self):
-        allowed = {0xA0, 0xA1, 0xA2, 0xB0, 0xB1, 0xB3, 0xC0, 0xC1}
+        allowed = {0xA0, 0xA1, 0xA2, 0xB0, 0xB1, 0xB2, 0xB3, 0xC0, 0xC1}
         for cmd in set(range(256)) - allowed:
             with self.assertRaises(UnsafeCommand):
                 btl.build_frame(cmd, 0, b"", True, bytes(16))

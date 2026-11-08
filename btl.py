@@ -268,6 +268,10 @@ class Btl:
         d = self.cmd(0xB0, 2, identity32.ljust(32, b"\0")[:32], encrypt=True, timeout=8000)
         return d
 
+    def remove_identity(self, identity32: bytes):
+        """Remove the template(s) enrolled under this identity. All-zero is refused by safety.py."""
+        return self.cmd(0xB2, 1, identity32, encrypt=True, timeout=5000)
+
     def enroll_cancel(self):
         return self.cmd(0xB0, 3, b"\x00", encrypt=True)
 

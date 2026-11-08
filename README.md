@@ -18,16 +18,18 @@ SM4-encrypted after an SM2 key exchange.
 | Framing, CRC, SM2 key exchange, SM4 encryption | ✅ verified |
 | Enroll (7 touches), identify, verify | ✅ Python tool and libfprint driver |
 | Foreign/stale templates can't authenticate (template id + tag check) | ✅ verified |
+| Delete a print from the module (per-print identity) | ✅ verified |
+| Wipe all templates | ❌ deliberately not implemented (see Safety) |
 | Cancel (module-side cancel command) | implemented, not yet tested |
-| fprintd / PAM | ⏳ needs a libfprint build with the driver installed |
-| Delete prints from the module | ❌ host-side only. The remove command is blocked (see Safety) |
+| fprintd / PAM | ⏳ package `libfprint-btl-syno` built, fprintd test pending |
 
 ## Safety
 
 This project follows a strict **allowlist**: only the command shapes the Windows driver itself
-sends during init/enroll/identify can be transmitted. The module also implements template removal
-(including "remove all"), firmware update, a switch into its bootloader, JTAG control and an MCU
-restore; none of these can be sent. A sister project lost a reader to one such command.
+sends during init/enroll/identify/delete can be transmitted. Removal is only possible with a
+print's own ASCII identity; the all-zero identity (remove **all**) is refused. Firmware update, the
+switch into the bootloader, JTAG control and an MCU restore can't be sent at all. A sister project
+lost a reader to an unvetted "clear" command.
 
 ## Layout
 
@@ -35,6 +37,7 @@ restore; none of these can be sent. A sister project lost a reader to one such c
 |---|---|
 | `driver/` | libfprint driver `betterlife.c/.h` (copy of what the patch adds) |
 | `packaging/0001-add-betterlife-driver.patch` | patch against libfprint v1.94.100 |
+| `packaging/arch/` | `libfprint-btl-syno` PKGBUILD: libfprint + synochip + betterlife drivers |
 | `btl.py`, `btlcrypto.py`, `safety.py` | Python userspace driver, pure-Python SM2/SM3/SM4, allowlist |
 | `tests/` | offline tests (crypto vectors, frame codec, Python and C allowlists) |
 | `experiments/` | interactive hardware tests |

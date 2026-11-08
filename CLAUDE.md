@@ -9,9 +9,11 @@ assumed "clear all" opcode; that is why this project is allowlist-only).
 - **SAFETY (do not weaken):** only allowlisted command shapes may be sent. Python: `safety.py`
   `check_command()` inside `btl.build_frame()` (no override). C: `btl_cmd_allowed()` in `btl_cmd()`.
   `tests/test_offline.py` + `tests/test_c_allowlist.py` enforce both. Never write raw bytes to EP 0x02.
-- **Never send** `B2` (remove; p1≠0 = remove ALL), `B4 B5 B6`, `C2` (JTAG), `C3` (restore MCU),
-  `D0` (FW update), `D1` (bootloader switch). Enabling `B2` single-delete needs the user's explicit OK.
-- Enrolling consumes one of 10 module slots permanently while `B2` is blocked. Don't enroll casually.
+- **Never send** `B4 B5 B6`, `C2` (JTAG), `C3` (restore MCU), `D0` (FW update), `D1` (bootloader
+  switch), or `B2` with an all-zero identity (= remove ALL). `B2` is allowed only as p1=1 + an ASCII
+  identity (user approved 2026-11-09). Identities MUST be printable ASCII + NUL padding: a binary
+  identity leaks a module slot (see PROTOCOL.md "Remove").
+- 10 module slots; 1 is leaked (RE-NOTES "Module state"). Enroll tests should delete what they add.
 - Use `.venv/bin/python -I`. Device access: udev rule `70-libfprint-betterlife.rules` (installed).
 - Don't call pyusb `set_configuration()` on a configured device (data-toggle desync; see PROTOCOL.md).
 - Interactive tests: run in background via `experiments/run.sh <script> <log>`, tell the user exactly
@@ -28,3 +30,7 @@ assumed "clear all" opcode; that is why this project is allowlist-only).
   `git -C libfprint diff HEAD -- meson.build libfprint/meson.build data/autosuspend.hwdb libfprint/drivers/betterlife > packaging/0001-add-betterlife-driver.patch`,
   run `.venv/bin/python -m unittest discover -s tests`.
 - umockdev is not installed, so libfprint driver tests skip.
+- `examples/verify` fails with "Device has no storage" (no `list`); use
+  `experiments/lf_verify_delete.py` (GI against libfprint/build, needs GI_TYPELIB_PATH/LD_LIBRARY_PATH).
+- Package: `packaging/arch` (`libfprint-btl-syno`, replaces libfprint-synochip). After changing the
+  driver: copy patch to `packaging/arch/0002-…`, update its b2sum + pkgrel, `makepkg -fC --nocheck`.

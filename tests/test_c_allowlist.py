@@ -45,9 +45,20 @@ class CAllowlist(unittest.TestCase):
 
     def test_send_path_checks_allowlist(self):
         fn = re.search(r"\nbtl_cmd \(FpiDeviceBetterlife.*?\n\}", self.c, re.S).group(0)
-        self.assertIn("btl_cmd_allowed (cmd, p1, encrypt, len)", fn)
+        self.assertIn("btl_cmd_allowed (cmd, p1, encrypt, data, len)", fn)
         # only one place submits to the OUT endpoint
         self.assertEqual(self.c.count("BTL_EP_OUT"), 1)
+
+
+    def test_remove_all_guard(self):
+        fn = re.search(r"\nbtl_cmd_allowed \(.*?\n\}", self.c, re.S).group(0)
+        self.assertIn("cmd == BTL_CMD_REMOVE ||", fn)
+        self.assertIn("!btl_identity_valid (data, len)", fn)
+        iv = re.search(r"\nbtl_identity_valid \(.*?\n\}", self.c, re.S).group(0)
+        self.assertIn("if (n == 0 || n == len)", iv)       # rejects all-zero and unterminated
+        self.assertEqual(self.defs["BTL_CMD_REMOVE"], 0xB2)
+        # the only remove call site sends a print's identity
+        self.assertEqual(len(re.findall(r"btl_cmd \(self, BTL_CMD_REMOVE", self.c)), 1)
 
 
 if __name__ == "__main__":
