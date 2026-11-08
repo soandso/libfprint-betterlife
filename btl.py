@@ -220,11 +220,6 @@ class Btl:
         d = self.recv(timeout=700)["data"]
         return dict(crypto=d[0], project_code=(d[1], d[2]), version=d[3:7].hex("."), raw=d.hex(" "))
 
-    def _unused_init(self):
-        info = self.fw_version()
-        sch = self.scheme()
-        self.key_exchange()
-        return info, sch
 
     # --- identify --------------------------------------------------------------------
     def identify(self, timeout=15.0):
